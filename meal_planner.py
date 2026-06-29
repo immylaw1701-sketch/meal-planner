@@ -201,25 +201,38 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    col_map = {}
+    # Remove blank exported columns
+    df = df.loc[:, [c for c in df.columns if str(c).strip() != ""]].copy()
+
+    exact_map = {
+        "name": "Name",
+        "recipe name": "Name",
+        "servings": "Servings",
+        "serving": "Servings",
+        "ingredients": "Ingredients",
+        "ingredient": "Ingredients",
+        "steps": "Steps",
+        "method": "Steps",
+        "tried": "Tried",
+        "type": "Type",
+    }
+
+    rename_map = {}
 
     for c in df.columns:
-        lc = str(c).lower()
+        lc = str(c).strip().lower()
 
-        if "name" in lc:
-            col_map[c] = "Name"
-        elif "serving" in lc:
-            col_map[c] = "Servings"
-        elif "ingredient" in lc:
-            col_map[c] = "Ingredients"
-        elif "step" in lc or "method" in lc:
-            col_map[c] = "Steps"
-        elif "tried" in lc:
-            col_map[c] = "Tried"
-        elif "type" in lc:
-            col_map[c] = "Type"
+        if lc in exact_map:
+            new_name = exact_map[lc]
 
-    df = df.rename(columns=col_map)
+            # Only allow one source column for each final column
+            if new_name not in rename_map.values():
+                rename_map[c] = new_name
+
+    df = df.rename(columns=rename_map)
+
+    # Safety: if duplicate columns still exist, keep the first one
+    df = df.loc[:, ~df.columns.duplicated()].copy()
 
     required = ["Name", "Servings", "Ingredients", "Steps", "Tried", "Type"]
 
@@ -237,7 +250,6 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["Name"] != ""]
 
     return df[required].reset_index(drop=True)
-
 
 def parse_price(value):
     """Convert £0.39, 0.39, N/A, blanks etc into a float or NaN."""

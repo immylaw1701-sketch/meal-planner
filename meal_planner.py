@@ -307,7 +307,7 @@ def clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in supermarket_cols:
         df[col] = df[col].apply(parse_price)
 
-    df["Price_Key"] = df["Ingredients"].apply(normalise_ingredient_token)
+    df["Price_Key"] = df["Ingredients"].apply(price_match_key)
 
     # Count is kept only as reference data. It is not used in the price calculation.
     # If duplicate ingredient keys exist, keep the first one in the sheet.
@@ -437,7 +437,30 @@ def strip_quantity_and_unit_from_ingredient(item: str) -> str:
     )
 
     return item.strip()
-    
+
+
+def price_match_key(value: str) -> str:
+    """
+    Create the matching key used between Sheet1 ingredients and the Price sheet.
+
+    This mirrors the Google Sheets extraction logic:
+    - removes leading quantity + unit
+    - removes leading quantity only
+    - lowercases
+    - removes punctuation
+    - trims spaces
+    """
+
+    value = strip_quantity_and_unit_from_ingredient(value)
+
+    value = str(value).strip().lower()
+    value = re.sub(r"[^\w\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+
+    return value
+
+
+
 
 def normalise_ingredient_token(token: str) -> str:
     """Clean ingredient text so similar ingredient names match better."""
@@ -745,7 +768,7 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
     for item in ingredient_items(row["Ingredients"]):
         amount, recipe_unit, ingredient_text = parse_ingredient_quantity(item)
 
-        key = normalise_ingredient_token(ingredient_text)
+        key = price_match_key(ingredient_text)
 
         display_name = ingredient_text.strip()
 

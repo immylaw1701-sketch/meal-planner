@@ -3,9 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 import textwrap
-import gspread
 
-from google.oauth2.service_account import Credentials
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from fpdf import FPDF
@@ -21,9 +19,12 @@ st.set_page_config(
 )
 
 
-# ── Google Sheet settings ───────────────────────────────────────────────────
-SPREADSHEET_NAME = "Meal plan"
-WORKSHEET_NAME = "Sheet1"
+# ── Google Sheet CSV URL ────────────────────────────────────────────────────
+GOOGLE_SHEET_CSV_URL = (
+    "https://docs.google.com/spreadsheets/d/e/"
+    "2PACX-1vQPVOLW-IYb4T3HojVWtCxgXw1wmXl4TQSU1QAuDRc9A-o0h36DOXS5Rp6YagT-E2YB6Z0P1tcaxOj5/"
+    "pub?gid=0&single=true&output=csv"
+)
 
 
 # ── Colour scheme ───────────────────────────────────────────────────────────
@@ -225,27 +226,9 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_recipes() -> pd.DataFrame:
-    """Load recipe data directly from Google Sheets."""
+    """Load recipe data from the published Google Sheet CSV link."""
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-
-    service_account_info = dict(st.secrets["gcp_service_account"])
-
-    creds = Credentials.from_service_account_info(
-        service_account_info,
-        scopes=scopes,
-    )
-
-    gc = gspread.authorize(creds)
-
-    spreadsheet = gc.open(SPREADSHEET_NAME)
-    worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
-
-    data = worksheet.get_all_records()
-    raw_df = pd.DataFrame(data)
+    raw_df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
 
     return clean_df(raw_df)
 
@@ -725,7 +708,7 @@ def main():
     try:
         df = load_recipes()
     except Exception as e:
-        st.error("Could not load recipes from Google Sheets.")
+        st.error("Could not load recipes from the published Google Sheet CSV.")
         st.exception(e)
         return
 

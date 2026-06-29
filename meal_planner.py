@@ -473,9 +473,6 @@ def normalise_ingredient_token(token: str) -> str:
 
     words = [replacements.get(w, w) for w in words]
 
-    if "garlic" in words:
-        return "garlic"
-
     # Remove duplicate words while preserving order.
     words = list(dict.fromkeys(words))
 

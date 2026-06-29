@@ -1184,8 +1184,17 @@ def render_recipe_card(
 
     if price_summary and price_summary.get("has_prices"):
         price_text = format_shop_price(price_summary)
+        missing_count = int(price_summary.get("best_missing", 0))
+
+        if missing_count == 0:
+            missing_text = "All ingredients priced"
+        elif missing_count == 1:
+            missing_text = "1 ingredient missing price"
+        else:
+            missing_text = f"{missing_count} ingredients missing prices"
     else:
         price_text = "No price data"
+        missing_text = "Price data unavailable"
 
     st.markdown(
         f"""
@@ -1205,6 +1214,9 @@ def render_recipe_card(
       <div class="price-line">
         Best price: <b>{price_text}</b>
       </div>
+      <div style="margin-top:2px;font-size:10.5px;color:{COLOURS['muted']};font-style:italic;">
+        {missing_text}
+      </div>
     </div>
     """,
         unsafe_allow_html=True,
@@ -1215,7 +1227,8 @@ def render_recipe_card(
             f"Serves: {serving_override}  |  "
             f"Type: {row['Type']}  |  "
             f"Status: {row['Tried']}  |  "
-            f"Best price: {price_text}"
+            f"Best price: {price_text}  |  "
+            f"{missing_text}"
         )
 
         st.markdown("---")
@@ -1233,8 +1246,6 @@ def render_recipe_card(
 
             for i, step in enumerate(steps, 1):
                 st.markdown(f"**{i}.** {step}")
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN APP
 # ══════════════════════════════════════════════════════════════════════════════

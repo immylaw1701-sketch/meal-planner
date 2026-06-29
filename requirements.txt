@@ -3,5 +3,3 @@ pandas
 numpy
 scikit-learn
 fpdf2
-gspread
-google-auth

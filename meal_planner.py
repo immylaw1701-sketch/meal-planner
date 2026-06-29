@@ -1154,36 +1154,84 @@ def build_multiple_plans(
     max_pasta_per_plan: int,
     sim_matrix: np.ndarray,
 ) -> list[tuple[list[int], float]]:
-    """Build multiple meal plans."""
+    """
+    Build all possible valid meal plans.
+
+    n_plans is kept in the function signature so the rest of the app does not break,
+    but it is no longer used to limit generation. The app now generates every valid
+    plan first, then the display section chooses the top n_plans after sorting.
+    """
+
+    type_col = df["Type"].str.lower()
+
+    dessert_mask = type_col.str.contains(
+        "dessert|cake|bake|sweet|pudding|cookie|brownie",
+        na=False,
+    )
+
+    drink_mask = type_col.str.contains(
+        "drink|smoothie|juice|shake",
+        na=False,
+    )
+
+    if excluded_types:
+        excluded_lower = [e.lower() for e in excluded_types]
+        excluded_type_mask = type_col.isin(excluded_lower)
+    else:
+        excluded_type_mask = pd.Series([False] * len(df), index=df.index)
+
+    if excluded_recipes:
+        excluded_recipe_mask = df["Name"].isin(excluded_recipes)
+    else:
+        excluded_recipe_mask = pd.Series([False] * len(df), index=df.index)
+
+    excluded_mask = excluded_type_mask | excluded_recipe_mask
+
+    dessert_idx = df.index[dessert_mask & ~excluded_mask].tolist()
+    drink_idx = df.index[drink_mask & ~excluded_mask].tolist()
+    main_idx = df.index[~dessert_mask & ~drink_mask & ~excluded_mask].tolist()
+
+    n_main = int(n_meals) - int(n_desserts) - int(n_drinks)
+
+    if n_main < 0:
+        return []
+
+    if len(main_idx) < n_main:
+        return []
+
+    if len(dessert_idx) < int(n_desserts):
+        return []
+
+    if len(drink_idx) < int(n_drinks):
+        return []
+
+    def pasta_count(indices):
+        return sum(is_pasta_recipe(df.loc[i, "Name"]) for i in indices)
+
+    main_combos = list(combinations(main_idx, n_main))
+    dessert_combos = list(combinations(dessert_idx, int(n_desserts)))
+    drink_combos = list(combinations(drink_idx, int(n_drinks)))
+
+    if int(n_desserts) == 0:
+        dessert_combos = [()]
+
+    if int(n_drinks) == 0:
+        drink_combos = [()]
 
     plans = []
-    used_counts = np.zeros(len(df))
 
-    for _ in range(n_plans):
-        adj_sim = sim_matrix.copy()
+    for main_combo in main_combos:
+        for dessert_combo in dessert_combos:
+            for drink_combo in drink_combos:
+                selected = list(main_combo) + list(dessert_combo) + list(drink_combo)
 
-        for i in range(len(df)):
-            if used_counts[i] > 0:
-                adj_sim[i, :] *= 0.5 ** used_counts[i]
-                adj_sim[:, i] *= 0.5 ** used_counts[i]
+                if pasta_count(selected) > int(max_pasta_per_plan):
+                    continue
 
-        indices, score = generate_meal_plan(
-            df,
-            n_meals,
-            n_desserts,
-            n_drinks,
-            excluded_types,
-            excluded_recipes,
-            max_pasta_per_plan,
-            adj_sim,
-        )
+                plan_recipes = df.iloc[selected].reset_index(drop=True)
+                coverage_score, _ = plan_ingredient_coverage_score(plan_recipes)
 
-        plans.append((indices, score))
-
-        for i in indices:
-            used_counts[i] += 1
-
-    plans.sort(key=lambda x: x[1], reverse=True)
+                plans.append((selected, coverage_score))
 
     return plans
 
@@ -1481,7 +1529,7 @@ def main():
     all_types = sorted(df["Type"].dropna().unique().tolist())
 
     n_plans = st.sidebar.number_input(
-        "Number of meal plans to generate",
+        "Number of meal plans to show",
         min_value=1,
         max_value=10,
         value=3,
@@ -1693,6 +1741,9 @@ def main():
         return
 
     plans = st.session_state["plans"]
+    if not plans:
+        st.warning("No valid meal plans were found with the current filters.")
+        return
 
     # Build display data, including fresh scores and prices.
     plan_display = []
@@ -1739,6 +1790,13 @@ def main():
             key=lambda plan: plan["coverage_score"],
             reverse=True,
         )
+    
+    total_valid_plans = len(plan_display)
+    plan_display = plan_display[:int(n_plans)]
+    
+    st.caption(
+        f"Showing top {len(plan_display)} of {total_valid_plans} valid meal plans."
+    )
 
     st.markdown(
         f"""

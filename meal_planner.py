@@ -493,11 +493,14 @@ def empty_price_summary(price_df: pd.DataFrame) -> dict:
     return {
         "totals": {shop: 0.0 for shop in shops},
         "missing": {shop: 0 for shop in shops},
+        "missing_items": {shop: [] for shop in shops},
         "best_shop": None,
         "best_total": np.nan,
         "best_missing": 0,
+        "best_missing_items": [],
         "has_prices": False,
     }
+
 
 def parse_ingredient_quantity(item: str) -> tuple[float, str | None, str]:
     """
@@ -685,6 +688,7 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
 
     totals = {shop: 0.0 for shop in shops}
     missing = {shop: 0 for shop in shops}
+    missing_items = {shop: [] for shop in shops}
 
     price_lookup = price_df.set_index("Price_Key")
 
@@ -696,9 +700,16 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
 
         key = normalise_ingredient_token(ingredient_text)
 
+        # This is the readable name shown in the app.
+        display_name = ingredient_text.strip()
+
+        if not display_name:
+            display_name = item.strip()
+
         if not key or key not in price_lookup.index:
             for shop in shops:
                 missing[shop] += 1
+                missing_items[shop].append(display_name)
             continue
 
         price_row = price_lookup.loc[key]
@@ -713,6 +724,7 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
         if quantity_units is None:
             for shop in shops:
                 missing[shop] += 1
+                missing_items[shop].append(display_name)
             continue
 
         quantity_units = quantity_units * serving_multiplier
@@ -722,6 +734,7 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
 
             if pd.isna(price):
                 missing[shop] += 1
+                missing_items[shop].append(display_name)
             else:
                 totals[shop] += float(price) * quantity_units
 
@@ -739,12 +752,13 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
     return {
         "totals": totals,
         "missing": missing,
+        "missing_items": missing_items,
         "best_shop": best_shop,
         "best_total": totals[best_shop],
         "best_missing": missing[best_shop],
+        "best_missing_items": missing_items[best_shop],
         "has_prices": True,
     }
-
 
 
 
@@ -1164,7 +1178,6 @@ def generate_pdf(plan_recipes: pd.DataFrame, serving_overrides: dict, plan_num: 
 # ══════════════════════════════════════════════════════════════════════════════
 # UI COMPONENTS
 # ══════════════════════════════════════════════════════════════════════════════
-
 def render_recipe_card(
     row: pd.Series,
     serving_override: int,
@@ -1184,17 +1197,24 @@ def render_recipe_card(
 
     if price_summary and price_summary.get("has_prices"):
         price_text = format_shop_price(price_summary)
-        missing_count = int(price_summary.get("best_missing", 0))
+        missing_items = price_summary.get("best_missing_items", [])
 
-        if missing_count == 0:
-            missing_text = "All ingredients priced"
-        elif missing_count == 1:
-            missing_text = "1 ingredient missing price"
+        if missing_items:
+            missing_text = "Missing prices: " + ", ".join(missing_items)
         else:
-            missing_text = f"{missing_count} ingredients missing prices"
+            missing_text = ""
     else:
         price_text = "No price data"
-        missing_text = "Price data unavailable"
+        missing_text = ""
+
+    missing_html = ""
+
+    if missing_text:
+        missing_html = f"""
+      <div style="margin-top:2px;font-size:10.5px;color:{COLOURS['muted']};font-style:italic;">
+        {missing_text}
+      </div>
+        """
 
     st.markdown(
         f"""
@@ -1214,22 +1234,24 @@ def render_recipe_card(
       <div class="price-line">
         Best price: <b>{price_text}</b>
       </div>
-      <div style="margin-top:2px;font-size:10.5px;color:{COLOURS['muted']};font-style:italic;">
-        {missing_text}
-      </div>
+      {missing_html}
     </div>
     """,
         unsafe_allow_html=True,
     )
 
     with st.expander("Open recipe"):
-        st.caption(
+        caption_text = (
             f"Serves: {serving_override}  |  "
             f"Type: {row['Type']}  |  "
             f"Status: {row['Tried']}  |  "
-            f"Best price: {price_text}  |  "
-            f"{missing_text}"
+            f"Best price: {price_text}"
         )
+
+        if missing_text:
+            caption_text += f"  |  {missing_text}"
+
+        st.caption(caption_text)
 
         st.markdown("---")
 
@@ -1246,6 +1268,8 @@ def render_recipe_card(
 
             for i, step in enumerate(steps, 1):
                 st.markdown(f"**{i}.** {step}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN APP
 # ══════════════════════════════════════════════════════════════════════════════

@@ -592,6 +592,10 @@ def combine_price_summaries(price_summaries: list[dict], price_df: pd.DataFrame)
         "has_prices": True,
     }
 
+def is_pasta_recipe(name: str) -> bool:
+    """Return True if the recipe title contains Pasta."""
+
+    return "pasta" in str(name).lower()
 
 def format_price(value) -> str:
     """Format a price value."""
@@ -608,10 +612,18 @@ def format_shop_price(summary: dict) -> str:
     if not summary or not summary.get("has_prices") or summary.get("best_shop") is None:
         return "No price data"
 
+    missing = int(summary.get("best_missing", 0))
+
+    if missing == 0:
+        return (
+            f"{summary['best_shop']} "
+            f"{format_price(summary['best_total'])}"
+        )
+
     return (
         f"{summary['best_shop']} "
         f"{format_price(summary['best_total'])} "
-        f"({summary['best_missing']} N/A)"
+        f"({missing} N/A)"
     )
 
 
@@ -624,11 +636,15 @@ def format_all_shop_prices(summary: dict) -> str:
     parts = []
 
     for shop, total in summary["totals"].items():
-        missing = summary["missing"].get(shop, 0)
-        parts.append(f"**{shop}:** {format_price(total)} ({missing} N/A)")
+        missing = int(summary["missing"].get(shop, 0))
+
+        if missing == 0:
+            parts.append(f"**{shop}:** {format_price(total)}")
+        else:
+            parts.append(f"**{shop}:** {format_price(total)} ({missing} N/A)")
 
     return " &nbsp; | &nbsp; ".join(parts)
-
+    
 
 def plan_ingredient_coverage_score(plan_recipes: pd.DataFrame) -> tuple[float, dict]:
     """Score a meal plan based on how many ingredient tokens are shared."""
@@ -677,6 +693,8 @@ def generate_meal_plan(
     n_desserts: int,
     n_drinks: int,
     excluded_types: list[str],
+    excluded_recipes: list[str],
+    max_pasta_per_plan: int,
     sim_matrix: np.ndarray,
 ) -> tuple[list[int], float]:
     """Generate one meal plan."""
@@ -688,9 +706,16 @@ def generate_meal_plan(
 
     if excluded_types:
         excluded_lower = [e.lower() for e in excluded_types]
-        excluded_mask = type_col.isin(excluded_lower)
+        excluded_type_mask = type_col.isin(excluded_lower)
     else:
-        excluded_mask = pd.Series([False] * len(df), index=df.index)
+        excluded_type_mask = pd.Series([False] * len(df), index=df.index)
+
+    if excluded_recipes:
+        excluded_recipe_mask = df["Name"].isin(excluded_recipes)
+    else:
+        excluded_recipe_mask = pd.Series([False] * len(df), index=df.index)
+
+    excluded_mask = excluded_type_mask | excluded_recipe_mask
 
     dessert_idx = df.index[dessert_mask & ~excluded_mask].tolist()
     drink_idx = df.index[drink_mask & ~excluded_mask].tolist()
@@ -706,33 +731,77 @@ def generate_meal_plan(
     if n_main < 0:
         n_main = 0
 
+    def pasta_count(indices):
+        return sum(is_pasta_recipe(df.loc[i, "Name"]) for i in indices)
+
+    def can_add_recipe(current_indices, candidate_index):
+        if not is_pasta_recipe(df.loc[candidate_index, "Name"]):
+            return True
+
+        return pasta_count(current_indices) < max_pasta_per_plan
+
     if len(main_idx) >= 1 and n_main >= 1:
+        allowed_main_idx = [
+            i for i in main_idx
+            if can_add_recipe(selected, i)
+        ]
+
         if n_main == 1:
-            selected.append(main_idx[0])
+            if allowed_main_idx:
+                selected.append(allowed_main_idx[0])
+
         else:
-            best_pair = (
-                main_idx[0],
-                main_idx[1] if len(main_idx) > 1 else main_idx[0],
-            )
-            best_sim = -1
+            possible_pairs = []
 
             for a, b in combinations(main_idx[:30], 2):
-                s = sim_matrix[a, b]
+                test_indices = selected + [a, b]
 
-                if s > best_sim:
-                    best_sim = s
-                    best_pair = (a, b)
+                if pasta_count(test_indices) <= max_pasta_per_plan:
+                    possible_pairs.append((a, b))
 
-            chosen_main = list(best_pair)
+            if possible_pairs:
+                best_pair = possible_pairs[0]
+                best_sim = -1
+
+                for a, b in possible_pairs:
+                    s = sim_matrix[a, b]
+
+                    if s > best_sim:
+                        best_sim = s
+                        best_pair = (a, b)
+
+                chosen_main = list(best_pair)
+            else:
+                chosen_main = []
+
+                for candidate in main_idx:
+                    if len(chosen_main) >= n_main:
+                        break
+
+                    if can_add_recipe(selected + chosen_main, candidate):
+                        chosen_main.append(candidate)
+
             remaining = [i for i in main_idx if i not in chosen_main]
 
             while len(chosen_main) < n_main and remaining:
-                avg_sims = [
-                    np.mean([sim_matrix[r, c] for c in chosen_main])
-                    for r in remaining
+                allowed_remaining = [
+                    r for r in remaining
+                    if can_add_recipe(selected + chosen_main, r)
                 ]
 
-                best_next = remaining[int(np.argmax(avg_sims))]
+                if not allowed_remaining:
+                    break
+
+                if chosen_main:
+                    avg_sims = [
+                        np.mean([sim_matrix[r, c] for c in chosen_main])
+                        for r in allowed_remaining
+                    ]
+
+                    best_next = allowed_remaining[int(np.argmax(avg_sims))]
+                else:
+                    best_next = allowed_remaining[0]
+
                 chosen_main.append(best_next)
                 remaining.remove(best_next)
 
@@ -749,6 +818,7 @@ def generate_meal_plan(
     return selected, coverage_score
 
 
+
 def build_multiple_plans(
     df: pd.DataFrame,
     n_plans: int,
@@ -756,6 +826,8 @@ def build_multiple_plans(
     n_desserts: int,
     n_drinks: int,
     excluded_types: list[str],
+    excluded_recipes: list[str],
+    max_pasta_per_plan: int,
     sim_matrix: np.ndarray,
 ) -> list[tuple[list[int], float]]:
     """Build multiple meal plans."""
@@ -777,6 +849,8 @@ def build_multiple_plans(
             n_desserts,
             n_drinks,
             excluded_types,
+            excluded_recipes,
+            max_pasta_per_plan,
             adj_sim,
         )
 
@@ -788,7 +862,6 @@ def build_multiple_plans(
     plans.sort(key=lambda x: x[1], reverse=True)
 
     return plans
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PDF EXPORT
@@ -1057,6 +1130,19 @@ def main():
         default=[],
     )
 
+    excluded_recipes = st.sidebar.multiselect(
+        "Exclude specific recipes",
+        options=sorted(df["Name"].dropna().unique().tolist()),
+        default=[],
+    )
+
+    max_pasta_per_plan = st.sidebar.number_input(
+        "Max pasta dishes per plan",
+        min_value=0,
+        max_value=10,
+        value=1,
+    )
+
     sort_by = st.sidebar.selectbox(
         "Sort meal plans by",
         [
@@ -1200,6 +1286,8 @@ def main():
                 n_desserts=int(n_desserts),
                 n_drinks=int(n_drinks),
                 excluded_types=excluded_types,
+                excluded_recipes=excluded_recipes,
+                max_pasta_per_plan=int(max_pasta_per_plan),
                 sim_matrix=sim,
             )
 

@@ -1153,14 +1153,27 @@ def build_multiple_plans(
     excluded_recipes: list[str],
     max_pasta_per_plan: int,
     sim_matrix: np.ndarray,
+    sort_by: str,
+    candidate_pool_size: int,
+    recipe_price_summaries: dict | None = None,
 ) -> list[tuple[list[int], float]]:
     """
-    Build all possible valid meal plans.
+    Build meal plans from a smaller candidate pool.
 
-    n_plans is kept in the function signature so the rest of the app does not break,
-    but it is no longer used to limit generation. The app now generates every valid
-    plan first, then the display section chooses the top n_plans after sorting.
+    If sorting by cheapest:
+    - price each individual recipe first
+    - keep the cheapest candidate recipes
+    - build combinations from those
+    - sort plans by exact total price
+
+    If sorting by shared ingredient score:
+    - score each recipe by overlap potential
+    - keep the highest-overlap candidate recipes
+    - build combinations from those
+    - sort plans by exact shared ingredient score
     """
+
+    recipe_price_summaries = recipe_price_summaries or {}
 
     type_col = df["Type"].str.lower()
 
@@ -1208,17 +1221,71 @@ def build_multiple_plans(
     def pasta_count(indices):
         return sum(is_pasta_recipe(df.loc[i, "Name"]) for i in indices)
 
+    def recipe_price_key(index):
+        summary = recipe_price_summaries.get(index)
+
+        if not summary or not summary.get("has_prices"):
+            return (999999, 999999.0)
+
+        return (
+            int(summary.get("best_missing", 999999)),
+            float(summary.get("best_total", 999999.0)),
+        )
+
+    def recipe_overlap_score(index):
+        tokens = ingredient_tokens(df.loc[index, "Ingredients"])
+
+        if not tokens:
+            return 0
+
+        # Score recipes higher if their ingredients appear in many other recipes.
+        eligible_indices = main_idx + dessert_idx + drink_idx
+        all_tokens = []
+
+        for i in eligible_indices:
+            all_tokens.extend(ingredient_tokens(df.loc[i, "Ingredients"]))
+
+        token_counts = pd.Series(all_tokens).value_counts().to_dict()
+
+        return sum(token_counts.get(token, 0) for token in tokens)
+
+    def choose_candidates(indices):
+        if not indices:
+            return []
+
+        if sort_by == "Cheapest meal plan":
+            ordered = sorted(indices, key=recipe_price_key)
+        else:
+            ordered = sorted(indices, key=recipe_overlap_score, reverse=True)
+
+        return ordered[:int(candidate_pool_size)]
+
+    main_idx = choose_candidates(main_idx)
+    dessert_idx = choose_candidates(dessert_idx)
+    drink_idx = choose_candidates(drink_idx)
+
+    if len(main_idx) < n_main:
+        return []
+
+    if len(dessert_idx) < int(n_desserts):
+        return []
+
+    if len(drink_idx) < int(n_drinks):
+        return []
+
     main_combos = list(combinations(main_idx, n_main))
-    dessert_combos = list(combinations(dessert_idx, int(n_desserts)))
-    drink_combos = list(combinations(drink_idx, int(n_drinks)))
 
     if int(n_desserts) == 0:
         dessert_combos = [()]
+    else:
+        dessert_combos = list(combinations(dessert_idx, int(n_desserts)))
 
     if int(n_drinks) == 0:
         drink_combos = [()]
+    else:
+        drink_combos = list(combinations(drink_idx, int(n_drinks)))
 
-    plans = []
+    scored_plans = []
 
     for main_combo in main_combos:
         for dessert_combo in dessert_combos:
@@ -1231,10 +1298,43 @@ def build_multiple_plans(
                 plan_recipes = df.iloc[selected].reset_index(drop=True)
                 coverage_score, _ = plan_ingredient_coverage_score(plan_recipes)
 
-                plans.append((selected, coverage_score))
+                if sort_by == "Cheapest meal plan":
+                    plan_missing = 0
+                    plan_total = 0.0
 
-    return plans
+                    for idx in selected:
+                        summary = recipe_price_summaries.get(idx)
 
+                        if summary and summary.get("has_prices"):
+                            plan_missing += int(summary.get("best_missing", 999999))
+                            plan_total += float(summary.get("best_total", 999999.0))
+                        else:
+                            plan_missing += 999999
+                            plan_total += 999999.0
+
+                    sort_key = (plan_missing, plan_total)
+                else:
+                    sort_key = (-coverage_score,)
+
+                scored_plans.append(
+                    {
+                        "indices": selected,
+                        "coverage_score": coverage_score,
+                        "sort_key": sort_key,
+                    }
+                )
+
+    if sort_by == "Cheapest meal plan":
+        scored_plans.sort(key=lambda x: x["sort_key"])
+    else:
+        scored_plans.sort(key=lambda x: x["sort_key"])
+
+    scored_plans = scored_plans[:int(n_plans)]
+
+    return [
+        (plan["indices"], plan["coverage_score"])
+        for plan in scored_plans
+    ]
 # ══════════════════════════════════════════════════════════════════════════════
 # PDF EXPORT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1583,6 +1683,18 @@ def main():
         ],
     )
 
+    candidate_pool_size = st.sidebar.number_input(
+        "Candidate recipes to check",
+        min_value=5,
+        max_value=len(df),
+        value=min(50, len(df)),
+        help=(
+            "For cheapest plans, this keeps the cheapest individual recipes. "
+            "For shared ingredient score, this keeps the recipes with the highest ingredient-overlap potential."
+        ),
+    )
+    
+
     # Servings
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Servings")
@@ -1711,6 +1823,17 @@ def main():
         with st.spinner("Analysing ingredients and building meal plans..."):
             sim = compute_similarity_matrix(tuple(df["Ingredients"].tolist()))
 
+            recipe_price_summaries_for_generation = {}
+
+            if sort_by == "Cheapest meal plan":
+                for idx, row in df.iterrows():
+                    serving = get_serving(row["Name"])
+                    recipe_price_summaries_for_generation[idx] = calculate_recipe_price(
+                        row,
+                        serving,
+                        price_df,
+                    )
+
             plans = build_multiple_plans(
                 df=df,
                 n_plans=int(n_plans),
@@ -1721,6 +1844,9 @@ def main():
                 excluded_recipes=excluded_recipes,
                 max_pasta_per_plan=int(max_pasta_per_plan),
                 sim_matrix=sim,
+                sort_by=sort_by,
+                candidate_pool_size=int(candidate_pool_size),
+                recipe_price_summaries=recipe_price_summaries_for_generation,
             )
 
             st.session_state["plans"] = plans
@@ -1778,24 +1904,9 @@ def main():
             }
         )
 
-    if sort_by == "Cheapest meal plan":
-        plan_display.sort(
-            key=lambda plan: (
-                plan["plan_price_summary"].get("best_missing", 999999),
-                plan["plan_price_summary"].get("best_total", 999999),
-            )
-        )
-    else:
-        plan_display.sort(
-            key=lambda plan: plan["coverage_score"],
-            reverse=True,
-        )
-    
-    total_valid_plans = len(plan_display)
-    plan_display = plan_display[:int(n_plans)]
-    
     st.caption(
-        f"Showing top {len(plan_display)} of {total_valid_plans} valid meal plans."
+        f"Showing top {len(plan_display)} meal plans using a candidate pool of up to "
+        f"{int(candidate_pool_size)} recipes per recipe group."
     )
 
     st.markdown(

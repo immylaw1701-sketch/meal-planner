@@ -275,17 +275,20 @@ def clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.rename(columns={ingredient_col: "Ingredients"})
 
-    if "Count" in df.columns:
-        df["Count"] = pd.to_numeric(df["Count"], errors="coerce").fillna(0)
-    else:
+    if "Unit" not in df.columns:
+        df["Unit"] = "piece"
+
+    if "Count" not in df.columns:
         df["Count"] = 0
 
     df["Ingredients"] = df["Ingredients"].fillna("").astype(str).str.strip()
+    df["Unit"] = df["Unit"].fillna("piece").astype(str).str.strip().str.lower()
+
     df = df[df["Ingredients"] != ""]
 
     supermarket_cols = [
         c for c in df.columns
-        if c not in {"Ingredients", "Count"}
+        if c not in {"Ingredients", "Count", "Unit"}
     ]
 
     for col in supermarket_cols:
@@ -293,12 +296,11 @@ def clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Price_Key"] = df["Ingredients"].apply(normalise_ingredient_token)
 
-    # If two rows normalise to the same ingredient, keep the one with the highest Count.
-    df = df.sort_values("Count", ascending=False)
+    # Count is kept only as reference data. It is not used in the price calculation.
+    # If duplicate ingredient keys exist, keep the first one in the sheet.
     df = df.drop_duplicates(subset=["Price_Key"], keep="first")
 
     return df.reset_index(drop=True)
-
 
 @st.cache_data(ttl=300)
 def load_recipes() -> pd.DataFrame:
@@ -467,7 +469,7 @@ def supermarket_columns(price_df: pd.DataFrame) -> list[str]:
 
     return [
         c for c in price_df.columns
-        if c not in {"Ingredients", "Count", "Price_Key"}
+        if c not in {"Ingredients", "Count", "Unit", "Price_Key"}
     ]
 
 
@@ -485,13 +487,126 @@ def empty_price_summary(price_df: pd.DataFrame) -> dict:
         "has_prices": False,
     }
 
+def parse_ingredient_quantity(item: str) -> tuple[float, str | None, str]:
+    """
+    Read the amount and unit from an ingredient line.
+
+    Examples:
+    - 200g sugar      -> 200, g
+    - 1.5 tsp oil    -> 1.5, tsp
+    - 2 egg          -> 2, piece
+    - onion          -> 1, piece
+    """
+
+    item = str(item).strip()
+
+    value, end_idx = _parse_number(item)
+
+    if value is None:
+        return 1.0, "piece", item
+
+    rest = item[end_idx:].strip()
+
+    unit_match = re.match(r"^([a-zA-Z]+)", rest)
+
+    if unit_match:
+        unit = unit_match.group(1).lower()
+        ingredient_text = rest[unit_match.end():].strip()
+    else:
+        unit = "piece"
+        ingredient_text = rest.strip()
+
+    return float(value), unit, ingredient_text
+
+
+def convert_recipe_amount_to_price_units(amount: float, recipe_unit: str | None, price_unit: str) -> float | None:
+    """
+    Convert a recipe amount into the unit used by the Price sheet.
+
+    Price sheet units supported:
+    - 100g
+    - 100ml
+    - piece
+    """
+
+    recipe_unit = str(recipe_unit or "piece").lower().strip()
+    price_unit = str(price_unit or "piece").lower().strip()
+
+    weight_units = {
+        "g": 1,
+        "gram": 1,
+        "grams": 1,
+        "kg": 1000,
+        "kilogram": 1000,
+        "kilograms": 1000,
+    }
+
+    volume_units = {
+        "ml": 1,
+        "millilitre": 1,
+        "millilitres": 1,
+        "l": 1000,
+        "litre": 1000,
+        "litres": 1000,
+    }
+
+    piece_units = {
+        "piece",
+        "pieces",
+        "whole",
+        "egg",
+        "eggs",
+        "onion",
+        "onions",
+        "clove",
+        "cloves",
+    }
+
+    if price_unit == "100g":
+        if recipe_unit in weight_units:
+            grams = amount * weight_units[recipe_unit]
+            return grams / 100
+
+        # If the recipe does not give a weight, assume one 100g price unit.
+        return 1.0
+
+    if price_unit == "100ml":
+        if recipe_unit in volume_units:
+            ml = amount * volume_units[recipe_unit]
+            return ml / 100
+
+        # If the recipe does not give a volume, assume one 100ml price unit.
+        return 1.0
+
+    if price_unit in {"piece", "each", "1 piece"}:
+        if recipe_unit in piece_units:
+            return amount
+
+        # If it says "2 large onion", this still returns 2.
+        return amount
+
+    return None
+
+
+def ingredient_items(ingredients_str: str) -> list[str]:
+    """Split a recipe ingredient cell into ingredient lines."""
+
+    return [i.strip() for i in str(ingredients_str).split(";") if i.strip()]
+
+
 
 def calculate_tokens_price(
     tokens: list[str],
     price_df: pd.DataFrame,
     multiplier: float = 1.0,
 ) -> dict:
-    """Calculate supermarket totals and N/A counts for a list of ingredient tokens."""
+    """
+    Old fallback price calculator.
+
+    This is kept so the app does not break if anything else calls it,
+    but recipe pricing now uses calculate_recipe_price(), which reads
+    amounts and units properly.
+    """
 
     if price_df.empty:
         return empty_price_summary(price_df)
@@ -512,6 +627,11 @@ def calculate_tokens_price(
             continue
 
         row = price_lookup.loc[key]
+        price_unit = row.get("Unit", "piece")
+        quantity_units = convert_recipe_amount_to_price_units(1.0, "piece", price_unit)
+
+        if quantity_units is None:
+            quantity_units = 1.0
 
         for shop in shops:
             price = row[shop]
@@ -519,7 +639,7 @@ def calculate_tokens_price(
             if pd.isna(price):
                 missing[shop] += 1
             else:
-                totals[shop] += float(price) * multiplier
+                totals[shop] += float(price) * quantity_units * multiplier
 
     if not shops:
         return empty_price_summary(price_df)
@@ -542,18 +662,78 @@ def calculate_tokens_price(
     }
 
 
+
 def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.DataFrame) -> dict:
-    """Calculate the best shop and price for one recipe."""
+    """Calculate the best shop and price for one recipe using ingredient quantities."""
 
     if price_df.empty:
         return empty_price_summary(price_df)
 
+    shops = supermarket_columns(price_df)
+
+    totals = {shop: 0.0 for shop in shops}
+    missing = {shop: 0 for shop in shops}
+
+    price_lookup = price_df.set_index("Price_Key")
+
     original_servings = int(row["Servings"]) if int(row["Servings"]) > 0 else 1
-    multiplier = serving_override / original_servings
+    serving_multiplier = serving_override / original_servings
 
-    tokens = ingredient_tokens(row["Ingredients"])
+    for item in ingredient_items(row["Ingredients"]):
+        amount, recipe_unit, ingredient_text = parse_ingredient_quantity(item)
 
-    return calculate_tokens_price(tokens, price_df, multiplier=multiplier)
+        key = normalise_ingredient_token(ingredient_text)
+
+        if not key or key not in price_lookup.index:
+            for shop in shops:
+                missing[shop] += 1
+            continue
+
+        price_row = price_lookup.loc[key]
+        price_unit = price_row.get("Unit", "piece")
+
+        quantity_units = convert_recipe_amount_to_price_units(
+            amount=amount,
+            recipe_unit=recipe_unit,
+            price_unit=price_unit,
+        )
+
+        if quantity_units is None:
+            for shop in shops:
+                missing[shop] += 1
+            continue
+
+        quantity_units = quantity_units * serving_multiplier
+
+        for shop in shops:
+            price = price_row[shop]
+
+            if pd.isna(price):
+                missing[shop] += 1
+            else:
+                totals[shop] += float(price) * quantity_units
+
+    if not shops:
+        return empty_price_summary(price_df)
+
+    best_shop = sorted(
+        shops,
+        key=lambda shop: (
+            missing[shop],
+            totals[shop],
+        ),
+    )[0]
+
+    return {
+        "totals": totals,
+        "missing": missing,
+        "best_shop": best_shop,
+        "best_total": totals[best_shop],
+        "best_missing": missing[best_shop],
+        "has_prices": True,
+    }
+
+
 
 
 def combine_price_summaries(price_summaries: list[dict], price_df: pd.DataFrame) -> dict:

@@ -19,12 +19,17 @@ st.set_page_config(
 )
 
 
-# ── Google Sheet CSV URL ────────────────────────────────────────────────────
+# ── Google Sheet CSV URLs ───────────────────────────────────────────────────
+# Main recipe sheet
 GOOGLE_SHEET_CSV_URL = (
     "https://docs.google.com/spreadsheets/d/e/"
     "2PACX-1vQPVOLW-IYb4T3HojVWtCxgXw1wmXl4TQSU1QAuDRc9A-o0h36DOXS5Rp6YagT-E2YB6Z0P1tcaxOj5/"
     "pub?gid=0&single=true&output=csv"
 )
+
+# Price sheet
+# Replace this with the published CSV link for your Price tab.
+PRICE_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPVOLW-IYb4T3HojVWtCxgXw1wmXl4TQSU1QAuDRc9A-o0h36DOXS5Rp6YagT-E2YB6Z0P1tcaxOj5/pub?gid=1515688392&single=true&output=csv"
 
 
 # ── Colour scheme ───────────────────────────────────────────────────────────
@@ -171,6 +176,16 @@ st.markdown(
     margin-right: 5px;
     vertical-align: middle;
   }}
+
+  .price-line {{
+    margin-top: 6px;
+    font-size: 12px;
+    color: {COLOURS['muted']};
+  }}
+
+  .price-line b {{
+    color: {COLOURS['text']};
+  }}
 </style>
 """,
     unsafe_allow_html=True,
@@ -224,6 +239,67 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df[required].reset_index(drop=True)
 
 
+def parse_price(value):
+    """Convert £0.39, 0.39, N/A, blanks etc into a float or NaN."""
+
+    if pd.isna(value):
+        return np.nan
+
+    value = str(value).strip()
+
+    if value == "" or value.lower() in {"n/a", "na", "nan", "none", "-"}:
+        return np.nan
+
+    value = value.replace("£", "").replace(",", "").strip()
+
+    try:
+        return float(value)
+    except ValueError:
+        return np.nan
+
+
+def clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean the price sheet."""
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    ingredient_col = None
+
+    for col in df.columns:
+        if str(col).lower() in {"ingredient", "ingredients"}:
+            ingredient_col = col
+            break
+
+    if ingredient_col is None:
+        return pd.DataFrame()
+
+    df = df.rename(columns={ingredient_col: "Ingredients"})
+
+    if "Count" in df.columns:
+        df["Count"] = pd.to_numeric(df["Count"], errors="coerce").fillna(0)
+    else:
+        df["Count"] = 0
+
+    df["Ingredients"] = df["Ingredients"].fillna("").astype(str).str.strip()
+    df = df[df["Ingredients"] != ""]
+
+    supermarket_cols = [
+        c for c in df.columns
+        if c not in {"Ingredients", "Count"}
+    ]
+
+    for col in supermarket_cols:
+        df[col] = df[col].apply(parse_price)
+
+    df["Price_Key"] = df["Ingredients"].apply(normalise_ingredient_token)
+
+    # If two rows normalise to the same ingredient, keep the one with the highest Count.
+    df = df.sort_values("Count", ascending=False)
+    df = df.drop_duplicates(subset=["Price_Key"], keep="first")
+
+    return df.reset_index(drop=True)
+
+
 @st.cache_data(ttl=300)
 def load_recipes() -> pd.DataFrame:
     """Load recipe data from the published Google Sheet CSV link."""
@@ -231,6 +307,18 @@ def load_recipes() -> pd.DataFrame:
     raw_df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
 
     return clean_df(raw_df)
+
+
+@st.cache_data(ttl=300)
+def load_prices() -> pd.DataFrame:
+    """Load price data from the published Price sheet CSV link."""
+
+    if not PRICE_SHEET_CSV_URL or "PASTE_PRICE_SHEET_CSV_LINK_HERE" in PRICE_SHEET_CSV_URL:
+        return pd.DataFrame()
+
+    raw_df = pd.read_csv(PRICE_SHEET_CSV_URL)
+
+    return clean_price_df(raw_df)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -293,7 +381,7 @@ def scale_ingredients(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIMILARITY AND MEAL PLAN GENERATION
+# SIMILARITY, INGREDIENTS AND PRICE HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data
@@ -327,26 +415,31 @@ def normalise_ingredient_token(token: str) -> str:
         "teaspoon", "teaspoons", "cup", "cups", "pinch", "handful",
         "small", "medium", "large", "fresh", "dried", "chopped", "sliced",
         "diced", "minced", "grated", "optional", "to", "taste", "of",
-        "and", "or", "a", "an", "the",
+        "and", "or", "a", "an", "the", "clove", "cloves",
     }
 
     words = [w for w in token.split() if w not in stop_words and len(w) > 2]
 
     replacements = {
         "chickens": "chicken",
-        "breasts": "chicken",
-        "thighs": "chicken",
+        "breasts": "breast",
+        "thighs": "thigh",
         "onions": "onion",
         "tomatoes": "tomato",
         "potatoes": "potato",
         "peppers": "pepper",
         "noodles": "noodle",
         "eggs": "egg",
-        "cloves": "garlic",
         "garlics": "garlic",
     }
 
     words = [replacements.get(w, w) for w in words]
+
+    if "garlic" in words:
+        return "garlic"
+
+    # Remove duplicate words while preserving order.
+    words = list(dict.fromkeys(words))
 
     return " ".join(words).strip()
 
@@ -364,6 +457,177 @@ def ingredient_tokens(ingredients_str: str) -> list[str]:
             cleaned.append(token)
 
     return cleaned
+
+
+def supermarket_columns(price_df: pd.DataFrame) -> list[str]:
+    """Find supermarket columns in the price table."""
+
+    if price_df.empty:
+        return []
+
+    return [
+        c for c in price_df.columns
+        if c not in {"Ingredients", "Count", "Price_Key"}
+    ]
+
+
+def empty_price_summary(price_df: pd.DataFrame) -> dict:
+    """Create an empty price summary."""
+
+    shops = supermarket_columns(price_df)
+
+    return {
+        "totals": {shop: 0.0 for shop in shops},
+        "missing": {shop: 0 for shop in shops},
+        "best_shop": None,
+        "best_total": np.nan,
+        "best_missing": 0,
+        "has_prices": False,
+    }
+
+
+def calculate_tokens_price(
+    tokens: list[str],
+    price_df: pd.DataFrame,
+    multiplier: float = 1.0,
+) -> dict:
+    """Calculate supermarket totals and N/A counts for a list of ingredient tokens."""
+
+    if price_df.empty:
+        return empty_price_summary(price_df)
+
+    shops = supermarket_columns(price_df)
+
+    totals = {shop: 0.0 for shop in shops}
+    missing = {shop: 0 for shop in shops}
+
+    price_lookup = price_df.set_index("Price_Key")
+
+    for token in tokens:
+        key = normalise_ingredient_token(token)
+
+        if not key or key not in price_lookup.index:
+            for shop in shops:
+                missing[shop] += 1
+            continue
+
+        row = price_lookup.loc[key]
+
+        for shop in shops:
+            price = row[shop]
+
+            if pd.isna(price):
+                missing[shop] += 1
+            else:
+                totals[shop] += float(price) * multiplier
+
+    if not shops:
+        return empty_price_summary(price_df)
+
+    best_shop = sorted(
+        shops,
+        key=lambda shop: (
+            missing[shop],
+            totals[shop],
+        ),
+    )[0]
+
+    return {
+        "totals": totals,
+        "missing": missing,
+        "best_shop": best_shop,
+        "best_total": totals[best_shop],
+        "best_missing": missing[best_shop],
+        "has_prices": True,
+    }
+
+
+def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.DataFrame) -> dict:
+    """Calculate the best shop and price for one recipe."""
+
+    if price_df.empty:
+        return empty_price_summary(price_df)
+
+    original_servings = int(row["Servings"]) if int(row["Servings"]) > 0 else 1
+    multiplier = serving_override / original_servings
+
+    tokens = ingredient_tokens(row["Ingredients"])
+
+    return calculate_tokens_price(tokens, price_df, multiplier=multiplier)
+
+
+def combine_price_summaries(price_summaries: list[dict], price_df: pd.DataFrame) -> dict:
+    """Combine recipe price summaries into one meal-plan summary."""
+
+    if price_df.empty:
+        return empty_price_summary(price_df)
+
+    shops = supermarket_columns(price_df)
+
+    totals = {shop: 0.0 for shop in shops}
+    missing = {shop: 0 for shop in shops}
+
+    for summary in price_summaries:
+        for shop in shops:
+            totals[shop] += summary["totals"].get(shop, 0.0)
+            missing[shop] += summary["missing"].get(shop, 0)
+
+    if not shops:
+        return empty_price_summary(price_df)
+
+    best_shop = sorted(
+        shops,
+        key=lambda shop: (
+            missing[shop],
+            totals[shop],
+        ),
+    )[0]
+
+    return {
+        "totals": totals,
+        "missing": missing,
+        "best_shop": best_shop,
+        "best_total": totals[best_shop],
+        "best_missing": missing[best_shop],
+        "has_prices": True,
+    }
+
+
+def format_price(value) -> str:
+    """Format a price value."""
+
+    if pd.isna(value):
+        return "N/A"
+
+    return f"£{float(value):.2f}"
+
+
+def format_shop_price(summary: dict) -> str:
+    """Format best shop and price."""
+
+    if not summary or not summary.get("has_prices") or summary.get("best_shop") is None:
+        return "No price data"
+
+    return (
+        f"{summary['best_shop']} "
+        f"{format_price(summary['best_total'])} "
+        f"({summary['best_missing']} N/A)"
+    )
+
+
+def format_all_shop_prices(summary: dict) -> str:
+    """Format all supermarket prices for display under each meal plan."""
+
+    if not summary or not summary.get("has_prices"):
+        return "No price data loaded."
+
+    parts = []
+
+    for shop, total in summary["totals"].items():
+        missing = summary["missing"].get(shop, 0)
+        parts.append(f"**{shop}:** {format_price(total)} ({missing} N/A)")
+
+    return " &nbsp; | &nbsp; ".join(parts)
 
 
 def plan_ingredient_coverage_score(plan_recipes: pd.DataFrame) -> tuple[float, dict]:
@@ -402,6 +666,10 @@ def plan_ingredient_coverage_score(plan_recipes: pd.DataFrame) -> tuple[float, d
 
     return float(score), details
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MEAL PLAN GENERATION
+# ══════════════════════════════════════════════════════════════════════════════
 
 def generate_meal_plan(
     df: pd.DataFrame,
@@ -632,7 +900,12 @@ def generate_pdf(plan_recipes: pd.DataFrame, serving_overrides: dict, plan_num: 
 # UI COMPONENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_recipe_card(row: pd.Series, serving_override: int, key_prefix: str):
+def render_recipe_card(
+    row: pd.Series,
+    serving_override: int,
+    key_prefix: str,
+    price_summary: dict | None = None,
+):
     """Render a recipe box using a Streamlit expander."""
 
     tried_value = str(row["Tried"]).lower()
@@ -643,6 +916,11 @@ def render_recipe_card(row: pd.Series, serving_override: int, key_prefix: str):
     scaled = scale_ingredients(row["Ingredients"], row["Servings"], serving_override)
     steps = [s.strip() for s in str(row["Steps"]).split(";") if s.strip()]
     n_ing = len(scaled)
+
+    if price_summary and price_summary.get("has_prices"):
+        price_text = format_shop_price(price_summary)
+    else:
+        price_text = "No price data"
 
     st.markdown(
         f"""
@@ -659,6 +937,9 @@ def render_recipe_card(row: pd.Series, serving_override: int, key_prefix: str):
         &nbsp;·&nbsp;
         {n_ing} ingredients
       </div>
+      <div class="price-line">
+        Best price: <b>{price_text}</b>
+      </div>
     </div>
     """,
         unsafe_allow_html=True,
@@ -668,7 +949,8 @@ def render_recipe_card(row: pd.Series, serving_override: int, key_prefix: str):
         st.caption(
             f"Serves: {serving_override}  |  "
             f"Type: {row['Type']}  |  "
-            f"Status: {row['Tried']}"
+            f"Status: {row['Tried']}  |  "
+            f"Best price: {price_text}"
         )
 
         st.markdown("---")
@@ -711,6 +993,13 @@ def main():
         st.error("Could not load recipes from the published Google Sheet CSV.")
         st.exception(e)
         return
+
+    try:
+        price_df = load_prices()
+    except Exception as e:
+        price_df = pd.DataFrame()
+        st.warning("Recipes loaded, but the Price sheet could not be loaded.")
+        st.exception(e)
 
     if df.empty:
         st.warning("Your Google Sheet loaded, but it does not contain any recipes.")
@@ -766,6 +1055,14 @@ def main():
         "Exclude recipe types",
         options=all_types,
         default=[],
+    )
+
+    sort_by = st.sidebar.selectbox(
+        "Sort meal plans by",
+        [
+            "Shared ingredient score",
+            "Cheapest meal plan",
+        ],
     )
 
     # Servings
@@ -884,7 +1181,13 @@ def main():
             default_serving_for_type(recipe_type),
         )
 
-    st.caption(f"{len(df)} recipes loaded from Google Sheets.")
+    if price_df.empty:
+        st.caption(f"{len(df)} recipes loaded from Google Sheets. No price data loaded yet.")
+    else:
+        st.caption(
+            f"{len(df)} recipes loaded from Google Sheets. "
+            f"{len(price_df)} priced ingredients loaded from Price sheet."
+        )
 
     if st.button("Generate Meal Plans", use_container_width=True):
         with st.spinner("Analysing ingredients and building meal plans..."):
@@ -919,24 +1222,74 @@ def main():
 
     plans = st.session_state["plans"]
 
+    # Build display data, including fresh scores and prices.
+    plan_display = []
+
+    for recipe_indices, score in plans:
+        plan_recipes = df.iloc[recipe_indices].reset_index(drop=True)
+        coverage_score, coverage_details = plan_ingredient_coverage_score(plan_recipes)
+
+        recipe_price_summaries = {}
+
+        for _, row in plan_recipes.iterrows():
+            serving = get_serving(row["Name"])
+            recipe_price_summaries[row["Name"]] = calculate_recipe_price(
+                row,
+                serving,
+                price_df,
+            )
+
+        plan_price_summary = combine_price_summaries(
+            list(recipe_price_summaries.values()),
+            price_df,
+        )
+
+        plan_display.append(
+            {
+                "recipe_indices": recipe_indices,
+                "plan_recipes": plan_recipes,
+                "coverage_score": coverage_score,
+                "coverage_details": coverage_details,
+                "recipe_price_summaries": recipe_price_summaries,
+                "plan_price_summary": plan_price_summary,
+            }
+        )
+
+    if sort_by == "Cheapest meal plan":
+        plan_display.sort(
+            key=lambda plan: (
+                plan["plan_price_summary"].get("best_missing", 999999),
+                plan["plan_price_summary"].get("best_total", 999999),
+            )
+        )
+    else:
+        plan_display.sort(
+            key=lambda plan: plan["coverage_score"],
+            reverse=True,
+        )
+
     st.markdown(
         f"""
     <div style='display:flex;gap:20px;align-items:center;margin-bottom:12px;'>
       <span><span class='legend-dot' style='background:{COLOURS["Tried"]}'></span>Tried</span>
       <span><span class='legend-dot' style='background:{COLOURS["Not Tried"]}'></span>Not Tried</span>
       <span style='color:{COLOURS["muted"]};font-size:12px;'>
-        Plans are ordered by shared ingredient score
+        Plans are sorted by {sort_by.lower()}
       </span>
     </div>
     """,
         unsafe_allow_html=True,
     )
 
-    for plan_idx, (recipe_indices, score) in enumerate(plans):
-        plan_recipes = df.iloc[recipe_indices].reset_index(drop=True)
+    for plan_idx, plan in enumerate(plan_display):
+        plan_recipes = plan["plan_recipes"]
+        coverage_score = plan["coverage_score"]
+        coverage_details = plan["coverage_details"]
+        recipe_price_summaries = plan["recipe_price_summaries"]
+        plan_price_summary = plan["plan_price_summary"]
 
-        coverage_score, coverage_details = plan_ingredient_coverage_score(plan_recipes)
         pct = int(coverage_score * 100)
+        best_price_text = format_shop_price(plan_price_summary)
 
         st.markdown(
             f"""
@@ -946,6 +1299,10 @@ def main():
             Shared ingredient score
           </span>
           <span style='font-weight:700;font-size:12px;margin-left:4px;'>{pct}%</span>
+          <span style='font-weight:300;font-size:11px;margin-left:18px;opacity:0.7;'>
+            Best total price
+          </span>
+          <span style='font-weight:700;font-size:12px;margin-left:4px;'>{best_price_text}</span>
         </div>
         <div class='plan-row-body'>
           <div class='similarity-bar-bg'>
@@ -960,6 +1317,11 @@ def main():
             f"{coverage_details['shared_ingredients']} of "
             f"{coverage_details['total_ingredients']} ingredients are shared with another recipe "
             f"in this plan. {coverage_details['unique_ingredients']} ingredients only appear once."
+        )
+
+        st.markdown(
+            format_all_shop_prices(plan_price_summary),
+            unsafe_allow_html=True,
         )
 
         with st.expander("See shared and unmatched ingredients"):
@@ -988,12 +1350,14 @@ def main():
 
         for col_idx, (_, row) in enumerate(plan_recipes.iterrows()):
             serving = get_serving(row["Name"])
+            recipe_price_summary = recipe_price_summaries.get(row["Name"])
 
             with cols[col_idx % n_cols]:
                 render_recipe_card(
                     row,
                     serving,
                     f"plan{plan_idx}_rec{col_idx}",
+                    recipe_price_summary,
                 )
 
         serving_dict = {
@@ -1053,9 +1417,15 @@ def main():
 
         for i, (_, row) in enumerate(filtered.iterrows()):
             serving = get_serving(row["Name"])
+            recipe_price_summary = calculate_recipe_price(row, serving, price_df)
 
             with cols[i % 3]:
-                render_recipe_card(row, serving, f"browse_{i}")
+                render_recipe_card(
+                    row,
+                    serving,
+                    f"browse_{i}",
+                    recipe_price_summary,
+                )
 
 
 if __name__ == "__main__":

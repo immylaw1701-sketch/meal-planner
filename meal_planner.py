@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 import textwrap
+import html
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -737,6 +738,7 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
     totals = {shop: 0.0 for shop in shops}
     missing = {shop: 0 for shop in shops}
     missing_items = {shop: [] for shop in shops}
+    ingredient_price_details = []
 
     price_lookup = price_df.set_index("Price_Key")
 
@@ -756,13 +758,32 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
         if not display_name:
             display_name = item.strip()
 
+        item_prices = {shop: np.nan for shop in shops}
+        item_missing = {shop: True for shop in shops}
+        matched_price_name = None
+        price_unit = None
+        quantity_units = None
+
         if not key or key not in price_lookup.index:
             for shop in shops:
                 missing[shop] += 1
                 missing_items[shop].append(display_name)
+
+            ingredient_price_details.append(
+                {
+                    "display_name": display_name,
+                    "matched_price_name": matched_price_name,
+                    "price_unit": price_unit,
+                    "quantity_units": quantity_units,
+                    "prices": item_prices,
+                    "missing": item_missing,
+                }
+            )
+
             continue
 
         price_row = price_lookup.loc[key]
+        matched_price_name = price_row.get("Ingredients", display_name)
         price_unit = price_row.get("Unit", "piece")
 
         quantity_units = convert_recipe_amount_to_price_units(
@@ -775,6 +796,18 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
             for shop in shops:
                 missing[shop] += 1
                 missing_items[shop].append(display_name)
+
+            ingredient_price_details.append(
+                {
+                    "display_name": display_name,
+                    "matched_price_name": matched_price_name,
+                    "price_unit": price_unit,
+                    "quantity_units": quantity_units,
+                    "prices": item_prices,
+                    "missing": item_missing,
+                }
+            )
+
             continue
 
         quantity_units = quantity_units * serving_multiplier
@@ -786,7 +819,21 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
                 missing[shop] += 1
                 missing_items[shop].append(display_name)
             else:
-                totals[shop] += float(price) * quantity_units
+                ingredient_total = float(price) * quantity_units
+                totals[shop] += ingredient_total
+                item_prices[shop] = ingredient_total
+                item_missing[shop] = False
+
+        ingredient_price_details.append(
+            {
+                "display_name": display_name,
+                "matched_price_name": matched_price_name,
+                "price_unit": price_unit,
+                "quantity_units": quantity_units,
+                "prices": item_prices,
+                "missing": item_missing,
+            }
+        )
 
     if not shops:
         return empty_price_summary(price_df)
@@ -803,6 +850,7 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
         "totals": totals,
         "missing": missing,
         "missing_items": missing_items,
+        "ingredient_price_details": ingredient_price_details,
         "best_shop": best_shop,
         "best_total": totals[best_shop],
         "best_missing": missing[best_shop],
@@ -1262,7 +1310,7 @@ def render_recipe_card(
     if missing_text:
         missing_html = f"""
       <div style="margin-top:2px;font-size:10.5px;color:{COLOURS['muted']};font-style:italic;">
-        {missing_text}
+        {html.escape(missing_text)}
       </div>
         """
 
@@ -1270,11 +1318,11 @@ def render_recipe_card(
         f"""
     <div class="recipe-card {tried_class}">
       <div style="font-family:'DM Serif Display',serif;font-size:15px;font-weight:600;color:{COLOURS['text']}">
-        {row['Name']}
+        {html.escape(str(row['Name']))}
       </div>
       <div style="margin-top:4px;">
-        <span class="badge {tried_badge}">{row['Tried']}</span>
-        <span class="type-chip">{row['Type']}</span>
+        <span class="badge {tried_badge}">{html.escape(str(row['Tried']))}</span>
+        <span class="type-chip">{html.escape(str(row['Type']))}</span>
       </div>
       <div style="margin-top:8px;font-size:12px;color:{COLOURS['muted']}">
         Serves <b style="color:{COLOURS['text']}">{serving_override}</b>
@@ -1282,7 +1330,7 @@ def render_recipe_card(
         {n_ing} ingredients
       </div>
       <div class="price-line">
-        Best price: <b>{price_text}</b>
+        Best price: <b>{html.escape(price_text)}</b>
       </div>
       {missing_html}
     </div>
@@ -1310,16 +1358,55 @@ def render_recipe_card(
         with col_i:
             st.markdown("**Ingredients**")
 
-            for ing in scaled:
-                st.markdown(f"- {ing}")
+            ingredient_price_details = []
+
+            if price_summary and price_summary.get("has_prices"):
+                ingredient_price_details = price_summary.get("ingredient_price_details", [])
+
+            best_shop = None
+
+            if price_summary and price_summary.get("has_prices"):
+                best_shop = price_summary.get("best_shop")
+
+            for i, ing in enumerate(scaled):
+                price_note = ""
+
+                if best_shop and i < len(ingredient_price_details):
+                    detail = ingredient_price_details[i]
+                    item_missing = detail.get("missing", {}).get(best_shop, True)
+                    item_price = detail.get("prices", {}).get(best_shop, np.nan)
+                    matched_name = detail.get("matched_price_name")
+                    price_unit = detail.get("price_unit")
+                    quantity_units = detail.get("quantity_units")
+
+                    if item_missing or pd.isna(item_price):
+                        price_note = f"{best_shop}: N/A"
+                    else:
+                        price_note = f"{best_shop}: {format_price(item_price)}"
+
+                        if price_unit and quantity_units is not None:
+                            price_note += f" ({quantity_units:.2f} × {price_unit})"
+
+                    if matched_name and str(matched_name).strip().lower() != str(detail.get("display_name", "")).strip().lower():
+                        price_note += f" · matched to {matched_name}"
+
+                if price_note:
+                    st.markdown(
+                        f"- {html.escape(str(ing))} "
+                        f"<span style='font-size:11px;color:{COLOURS['muted']};'>"
+                        f"{html.escape(price_note)}"
+                        f"</span>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(f"- {ing}")
 
         with col_s:
             st.markdown("**Method**")
 
             for i, step in enumerate(steps, 1):
                 st.markdown(f"**{i}.** {step}")
-
-
+                
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN APP
 # ══════════════════════════════════════════════════════════════════════════════

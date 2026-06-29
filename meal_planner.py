@@ -414,6 +414,29 @@ def compute_similarity_matrix(ingredients_list: tuple) -> np.ndarray:
     tfidf = vectoriser.fit_transform(list(ingredients_list))
     return cosine_similarity(tfidf)
 
+def strip_quantity_and_unit_from_ingredient(item: str) -> str:
+    """
+    Match the Google Sheets formula used to create the Price ingredient list.
+
+    Removes:
+    - leading number + recognised unit, e.g. 200g sugar -> sugar
+    - leading number only, e.g. 2 chicken breast -> chicken breast
+    - ranges, e.g. 2-3 tbsp oil -> oil
+    """
+
+    item = str(item).strip()
+
+    item = re.sub(
+        r"^\s*[0-9]+(?:\.[0-9]+)?(?:\s*-\s*[0-9]+(?:\.[0-9]+)?)?\s*"
+        r"(?:g|kg|ml|litre|litres|l|tbsp|tsp|cm|piece)\b\s*"
+        r"|^\s*[0-9]+(?:\.[0-9]+)?\s+",
+        "",
+        item,
+        flags=re.IGNORECASE,
+    )
+
+    return item.strip()
+    
 
 def normalise_ingredient_token(token: str) -> str:
     """Clean ingredient text so similar ingredient names match better."""
@@ -461,17 +484,17 @@ def normalise_ingredient_token(token: str) -> str:
 def ingredient_tokens(ingredients_str: str) -> list[str]:
     """Convert a recipe's ingredient cell into cleaned ingredient tokens."""
 
-    raw_items = [i.strip() for i in str(ingredients_str).split(";") if i.strip()]
     cleaned = []
 
-    for item in raw_items:
-        token = normalise_ingredient_token(item)
+    for item in ingredient_items(ingredients_str):
+        ingredient_text = strip_quantity_and_unit_from_ingredient(item)
+        token = normalise_ingredient_token(ingredient_text)
 
         if token:
             cleaned.append(token)
 
     return cleaned
-
+    
 
 def supermarket_columns(price_df: pd.DataFrame) -> list[str]:
     """Find supermarket columns in the price table."""
@@ -504,13 +527,8 @@ def empty_price_summary(price_df: pd.DataFrame) -> dict:
 
 def parse_ingredient_quantity(item: str) -> tuple[float, str | None, str]:
     """
-    Read the amount and unit from an ingredient line.
-
-    Examples:
-    - 200g sugar      -> 200, g
-    - 1.5 tsp oil    -> 1.5, tsp
-    - 2 egg          -> 2, piece
-    - onion          -> 1, piece
+    Read amount/unit for pricing, but use the same cleaned ingredient name
+    as the Google Sheets formula used to build the Price sheet.
     """
 
     item = str(item).strip()
@@ -518,20 +536,50 @@ def parse_ingredient_quantity(item: str) -> tuple[float, str | None, str]:
     value, end_idx = _parse_number(item)
 
     if value is None:
-        return 1.0, "piece", item
+        return 1.0, "piece", strip_quantity_and_unit_from_ingredient(item)
 
     rest = item[end_idx:].strip()
 
-    unit_match = re.match(r"^([a-zA-Z]+)", rest)
+    recognised_units = {
+        "g", "gram", "grams",
+        "kg", "kilogram", "kilograms",
+        "ml", "millilitre", "millilitres",
+        "l", "litre", "litres",
+        "tbsp", "tablespoon", "tablespoons",
+        "tsp", "teaspoon", "teaspoons",
+        "cup", "cups",
+        "pinch", "pinches",
+        "handful", "handfuls",
+        "clove", "cloves",
+        "piece", "pieces",
+        "slice", "slices",
+        "can", "cans",
+        "tin", "tins",
+        "jar", "jars",
+        "packet", "packets",
+        "pack", "packs",
+        "cm",
+    }
+
+    unit_match = re.match(r"^([a-zA-Z]+)\b", rest)
 
     if unit_match:
-        unit = unit_match.group(1).lower()
-        ingredient_text = rest[unit_match.end():].strip()
+        possible_unit = unit_match.group(1).lower()
+
+        if possible_unit in recognised_units:
+            unit = possible_unit
+        else:
+            unit = "piece"
     else:
         unit = "piece"
+
+    ingredient_text = strip_quantity_and_unit_from_ingredient(item)
+
+    if not ingredient_text:
         ingredient_text = rest.strip()
 
     return float(value), unit, ingredient_text
+
 
 
 def convert_recipe_amount_to_price_units(amount: float, recipe_unit: str | None, price_unit: str) -> float | None:
@@ -700,8 +748,10 @@ def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.D
 
         key = normalise_ingredient_token(ingredient_text)
 
-        # This is the readable name shown in the app.
         display_name = ingredient_text.strip()
+
+        if not display_name:
+            display_name = strip_quantity_and_unit_from_ingredient(item)
 
         if not display_name:
             display_name = item.strip()

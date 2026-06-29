@@ -1850,10 +1850,17 @@ def main():
         mask = pd.Series([True] * len(df), index=df.index)
 
         if search:
-            mask &= (
-                df["Name"].str.contains(search, case=False, na=False)
-                | df["Ingredients"].str.contains(search, case=False, na=False)
-            )
+            search_terms = [
+                term.strip()
+                for term in search.split(",")
+                if term.strip()
+            ]
+
+            for term in search_terms:
+                mask &= (
+                    df["Name"].str.contains(term, case=False, na=False, regex=False)
+                    | df["Ingredients"].str.contains(term, case=False, na=False, regex=False)
+                )
 
         if filter_type:
             mask &= df["Type"].isin(filter_type)

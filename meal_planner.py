@@ -32,7 +32,7 @@ GOOGLE_SHEET_CSV_URL = (
 # Price sheet ("Price 2" tab: Ingredient | Count | Shop | Name | Size | Price)
 # IMPORTANT: replace this with the published CSV link for your "Price 2" tab
 # specifically (it will have a different gid to your old Price tab).
-PRICE_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPVOLW-IYb4T3HojVWtCxgXw1wmXl4TQSU1QAuDRc9A-o0h36DOXS5Rp6YagT-E2YB6Z0P1tcaxOj5/pub?gid=1515688392&single=true&output=csv"
+PRICE_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPVOLW-IYb4T3HojVWtCxgXw1wmXl4TQSU1QAuDRc9A-o0h36DOXS5Rp6YagT-E2YB6Z0P1tcaxOj5/pub?gid=211392906&single=true&output=csv"
 
 
 # ── Colour scheme ───────────────────────────────────────────────────────────

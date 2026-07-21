@@ -916,6 +916,58 @@ def combine_price_summaries(price_summaries: list[dict], price_df: pd.DataFrame)
         "has_prices": True,
     }
 
+
+def build_consolidated_shopping_list(recipe_price_summaries: dict, best_shop: str | None) -> list[dict]:
+    """
+    Combine every recipe's priced ingredients into one shopping list for the PDF.
+
+    Ingredients are grouped by their matched Price-sheet name (falling back to
+    the recipe's own ingredient text if nothing matched), with quantities and
+    prices summed across all recipes in the plan. Pricing uses the plan's
+    single best_shop throughout, so the list total matches the plan total.
+    """
+
+    if not best_shop:
+        return []
+
+    combined = {}
+
+    for summary in recipe_price_summaries.values():
+        if not summary or not summary.get("has_prices"):
+            continue
+
+        for detail in summary.get("ingredient_price_details", []):
+            key = str(detail.get("matched_price_name") or detail.get("display_name") or "").strip().lower()
+
+            if not key:
+                continue
+
+            entry = combined.setdefault(
+                key,
+                {
+                    "display_name": detail.get("matched_price_name") or detail.get("display_name"),
+                    "price_unit": detail.get("price_unit"),
+                    "quantity_units": 0.0,
+                    "price": 0.0,
+                    "missing": False,
+                },
+            )
+
+            quantity_units = detail.get("quantity_units")
+            is_missing = detail.get("missing", {}).get(best_shop, True)
+            price = detail.get("prices", {}).get(best_shop, np.nan)
+
+            if quantity_units is not None:
+                entry["quantity_units"] += quantity_units
+
+            if is_missing or pd.isna(price):
+                entry["missing"] = True
+            else:
+                entry["price"] += float(price)
+
+    return sorted(combined.values(), key=lambda x: str(x["display_name"]).lower())
+
+
 def is_pasta_recipe(name: str) -> bool:
     """Return True if the recipe title contains Pasta."""
 
@@ -1369,8 +1421,16 @@ def pdf_line(value):
     return break_long_words(safe_pdf_text(value))
 
 
-def generate_pdf(plan_recipes: pd.DataFrame, serving_overrides: dict, plan_num: int) -> bytes:
+def generate_pdf(
+    plan_recipes: pd.DataFrame,
+    serving_overrides: dict,
+    plan_num: int,
+    recipe_price_summaries: dict | None = None,
+    plan_price_summary: dict | None = None,
+) -> bytes:
     """Generate a PDF of the meal plan."""
+
+    recipe_price_summaries = recipe_price_summaries or {}
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -1385,9 +1445,62 @@ def generate_pdf(plan_recipes: pd.DataFrame, serving_overrides: dict, plan_num: 
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(100, 100, 100)
     pdf.cell(0, 6, f"{len(plan_recipes)} recipes", ln=True, align="C")
+
+    if plan_price_summary and plan_price_summary.get("has_prices") and plan_price_summary.get("best_shop"):
+        pdf.cell(
+            0, 6,
+            pdf_line(f"Best total price: {format_shop_price(plan_price_summary)}"),
+            ln=True, align="C",
+        )
+
     pdf.set_text_color(0, 0, 0)
 
     pdf.ln(6)
+
+    # ── Full shopping list ──────────────────────────────────────────────
+    best_shop = plan_price_summary.get("best_shop") if plan_price_summary else None
+    shopping_list = build_consolidated_shopping_list(recipe_price_summaries, best_shop)
+
+    if shopping_list:
+        pdf.set_x(pdf.l_margin)
+        pdf.set_fill_color(44, 44, 44)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.multi_cell(0, 9, pdf_line(f"Full Shopping List - {best_shop}"), fill=True)
+        pdf.set_text_color(0, 0, 0)
+
+        pdf.set_font("Helvetica", "", 9)
+
+        for item in shopping_list:
+            name = item["display_name"] or ""
+            qty = item["quantity_units"] or 0.0
+            unit = item["price_unit"] or ""
+
+            price_text = "N/A" if item["missing"] else format_price(item["price"])
+            qty_text = f"{qty:.2f} x {unit}" if qty else ""
+
+            line = f"- {name}"
+
+            if qty_text:
+                line += f" ({qty_text})"
+
+            line += f": {price_text}"
+
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(0, 5, pdf_line(line))
+
+        pdf.ln(2)
+
+        if plan_price_summary and plan_price_summary.get("has_prices"):
+            list_total = plan_price_summary["totals"].get(best_shop, 0.0)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(
+                0, 6,
+                pdf_line(f"Shopping list total ({best_shop}): {format_price(list_total)}"),
+            )
+
+        pdf.ln(6)
 
     for _, row in plan_recipes.iterrows():
         desired = serving_overrides.get(row["Name"], row["Servings"])
@@ -1406,7 +1519,17 @@ def generate_pdf(plan_recipes: pd.DataFrame, serving_overrides: dict, plan_num: 
         pdf.set_text_color(120, 120, 120)
 
         tried_label = row["Tried"] if row["Tried"] else "Not Tried"
-        meta = f"{row['Type']} | Serves {desired} | {tried_label}"
+
+        recipe_price_summary = recipe_price_summaries.get(row["Name"])
+        recipe_price_text = (
+            format_shop_price(recipe_price_summary)
+            if recipe_price_summary else "No price data"
+        )
+
+        meta = (
+            f"{row['Type']} | Serves {desired} | {tried_label} | "
+            f"Best price: {recipe_price_text}"
+        )
 
         pdf.set_x(pdf.l_margin)
         pdf.multi_cell(0, 6, pdf_line(meta))
@@ -2010,6 +2133,8 @@ def main():
             plan_recipes,
             serving_dict,
             plan_idx + 1,
+            recipe_price_summaries=recipe_price_summaries,
+            plan_price_summary=plan_price_summary,
         )
 
         st.download_button(

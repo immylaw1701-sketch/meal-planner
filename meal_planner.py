@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import math
 import textwrap
 import html
 
@@ -28,8 +29,9 @@ GOOGLE_SHEET_CSV_URL = (
     "pub?gid=0&single=true&output=csv"
 )
 
-# Price sheet
-# Replace this with the published CSV link for your Price tab.
+# Price sheet ("Price 2" tab: Ingredient | Count | Shop | Name | Size | Price)
+# IMPORTANT: replace this with the published CSV link for your "Price 2" tab
+# specifically (it will have a different gid to your old Price tab).
 PRICE_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPVOLW-IYb4T3HojVWtCxgXw1wmXl4TQSU1QAuDRc9A-o0h36DOXS5Rp6YagT-E2YB6Z0P1tcaxOj5/pub?gid=1515688392&single=true&output=csv"
 
 
@@ -76,6 +78,38 @@ st.markdown(
   section[data-testid="stSidebar"] .stMultiSelect > div > div {{
     background-color: #3d3d3d;
     border: 1px solid #555;
+  }}
+
+  /* Fix: the typed search text inside multiselect/selectbox boxes was
+     inheriting forced-white text on a white input background, making it
+     invisible. Force a dark background on every nested input/value part. */
+  section[data-testid="stSidebar"] div[data-baseweb="select"] > div {{
+    background-color: #3d3d3d !important;
+  }}
+
+  section[data-testid="stSidebar"] div[data-baseweb="select"] input {{
+    background-color: transparent !important;
+    color: white !important;
+    -webkit-text-fill-color: white !important;
+  }}
+
+  section[data-testid="stSidebar"] div[data-baseweb="tag"] {{
+    background-color: {COLOURS['accent']} !important;
+  }}
+
+  /* The dropdown option list renders in a portal outside the sidebar, so it
+     does NOT inherit the sidebar's forced-white rule above - but force
+     readable colours explicitly anyway in case Streamlit changes this. */
+  ul[data-baseweb="menu"],
+  ul[role="listbox"] {{
+    background-color: #FFFFFF !important;
+  }}
+
+  ul[data-baseweb="menu"] li,
+  ul[role="listbox"] li,
+  ul[data-baseweb="menu"] li *,
+  ul[role="listbox"] li * {{
+    color: {COLOURS['text']} !important;
   }}
 
   .recipe-card {{
@@ -194,7 +228,7 @@ st.markdown(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA LOADING
+# DATA LOADING - RECIPES
 # ══════════════════════════════════════════════════════════════════════════════
 
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -252,6 +286,7 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
 
     return df[required].reset_index(drop=True)
 
+
 def parse_price(value):
     """Convert £0.39, 0.39, N/A, blanks etc into a float or NaN."""
 
@@ -271,50 +306,6 @@ def parse_price(value):
         return np.nan
 
 
-def clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean the price sheet."""
-
-    df.columns = [str(c).strip() for c in df.columns]
-
-    ingredient_col = None
-
-    for col in df.columns:
-        if str(col).lower() in {"ingredient", "ingredients"}:
-            ingredient_col = col
-            break
-
-    if ingredient_col is None:
-        return pd.DataFrame()
-
-    df = df.rename(columns={ingredient_col: "Ingredients"})
-
-    if "Unit" not in df.columns:
-        df["Unit"] = "piece"
-
-    if "Count" not in df.columns:
-        df["Count"] = 0
-
-    df["Ingredients"] = df["Ingredients"].fillna("").astype(str).str.strip()
-    df["Unit"] = df["Unit"].fillna("piece").astype(str).str.strip().str.lower()
-
-    df = df[df["Ingredients"] != ""]
-
-    supermarket_cols = [
-        c for c in df.columns
-        if c not in {"Ingredients", "Count", "Unit"}
-    ]
-
-    for col in supermarket_cols:
-        df[col] = df[col].apply(parse_price)
-
-    df["Price_Key"] = df["Ingredients"].apply(price_match_key)
-
-    # Count is kept only as reference data. It is not used in the price calculation.
-    # If duplicate ingredient keys exist, keep the first one in the sheet.
-    df = df.drop_duplicates(subset=["Price_Key"], keep="first")
-
-    return df.reset_index(drop=True)
-
 @st.cache_data(ttl=300)
 def load_recipes() -> pd.DataFrame:
     """Load recipe data from the published Google Sheet CSV link."""
@@ -324,16 +315,248 @@ def load_recipes() -> pd.DataFrame:
     return clean_df(raw_df)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA LOADING - PRICE 2 (Ingredient | Count | Shop | Name | Size | Price)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Base-unit conversions used to turn a Size cell into a (quantity, unit_type) pair.
+# unit_type is always one of "g", "ml", "piece" after conversion.
+SIZE_UNIT_CONVERSIONS = {
+    "g": ("g", 1), "gram": ("g", 1), "grams": ("g", 1),
+    "kg": ("g", 1000), "kilogram": ("g", 1000), "kilograms": ("g", 1000),
+    "ml": ("ml", 1), "millilitre": ("ml", 1), "millilitres": ("ml", 1),
+    "l": ("ml", 1000), "litre": ("ml", 1000), "litres": ("ml", 1000),
+    "piece": ("piece", 1), "pieces": ("piece", 1),
+}
+
+
+def parse_size(value) -> tuple[float, str] | tuple[None, None]:
+    """
+    Parse a Size cell such as '400g', '1L', '1 Piece', or a multipack
+    like '6x500ml', into (base_quantity, unit_type) where unit_type is
+    'g', 'ml', or 'piece'. Returns (None, None) if it can't be parsed.
+    """
+
+    value = str(value).strip().lower()
+
+    if not value:
+        return None, None
+
+    multipack = re.match(r"^(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*([a-z]+)$", value)
+
+    if multipack:
+        count = float(multipack.group(1))
+        each = float(multipack.group(2))
+        unit_word = multipack.group(3)
+
+        if unit_word not in SIZE_UNIT_CONVERSIONS:
+            return None, None
+
+        base_unit, mult = SIZE_UNIT_CONVERSIONS[unit_word]
+        return count * each * mult, base_unit
+
+    single = re.match(r"^(\d+(?:\.\d+)?)\s*([a-z]+)$", value)
+
+    if single:
+        qty = float(single.group(1))
+        unit_word = single.group(2)
+
+        if unit_word not in SIZE_UNIT_CONVERSIONS:
+            return None, None
+
+        base_unit, mult = SIZE_UNIT_CONVERSIONS[unit_word]
+        return qty * mult, base_unit
+
+    return None, None
+
+
+def strip_quantity_and_unit_from_ingredient(item: str) -> str:
+    """
+    Match the Google Sheets formula used to create the Price ingredient list.
+
+    Removes:
+    - leading number + recognised unit, e.g. 200g sugar -> sugar
+    - leading number only, e.g. 2 chicken breast -> chicken breast
+    - ranges, e.g. 2-3 tbsp oil -> oil
+    """
+
+    item = str(item).strip()
+
+    item = re.sub(
+        r"^\s*[0-9]+(?:\.[0-9]+)?(?:\s*-\s*[0-9]+(?:\.[0-9]+)?)?\s*"
+        r"(?:g|kg|ml|litre|litres|l|tbsp|tsp|cm|piece)\b\s*"
+        r"|^\s*[0-9]+(?:\.[0-9]+)?\s+",
+        "",
+        item,
+        flags=re.IGNORECASE,
+    )
+
+    return item.strip()
+
+
+def price_match_key(value: str) -> str:
+    """
+    Create the matching key used between recipe ingredients and the Price
+    sheet's Ingredient column.
+
+    - removes leading quantity + unit
+    - removes leading quantity only
+    - lowercases
+    - removes punctuation
+    - trims spaces
+    """
+
+    value = strip_quantity_and_unit_from_ingredient(value)
+
+    value = str(value).strip().lower()
+    value = re.sub(r"[^\w\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+
+    return value
+
+
+def normalise_ingredient_token(token: str) -> str:
+    """Clean ingredient text so similar ingredient names match better (used
+    only for the shared-ingredient overlap score, not for pricing)."""
+
+    token = str(token).lower().strip()
+
+    token = re.sub(r"\d+", "", token)
+    token = re.sub(r"[^\w\s]", " ", token)
+    token = re.sub(r"\s+", " ", token).strip()
+
+    stop_words = {
+        "g", "kg", "ml", "l", "tbsp", "tsp", "tablespoon", "tablespoons",
+        "teaspoon", "teaspoons", "cup", "cups", "pinch", "handful",
+        "small", "medium", "large", "fresh", "dried", "chopped", "sliced",
+        "diced", "minced", "grated", "optional", "to", "taste", "of",
+        "and", "or", "a", "an", "the", "clove", "cloves",
+    }
+
+    words = [w for w in token.split() if w not in stop_words and len(w) > 2]
+
+    replacements = {
+        "chickens": "chicken",
+        "breasts": "breast",
+        "thighs": "thigh",
+        "onions": "onion",
+        "tomatoes": "tomato",
+        "potatoes": "potato",
+        "peppers": "pepper",
+        "noodles": "noodle",
+        "eggs": "egg",
+        "garlics": "garlic",
+    }
+
+    words = [replacements.get(w, w) for w in words]
+
+    # Remove duplicate words while preserving order.
+    words = list(dict.fromkeys(words))
+
+    return " ".join(words).strip()
+
+
+def ingredient_items(ingredients_str: str) -> list[str]:
+    """Split a recipe ingredient cell into ingredient lines."""
+
+    return [i.strip() for i in str(ingredients_str).split(";") if i.strip()]
+
+
+def ingredient_tokens(ingredients_str: str) -> list[str]:
+    """Convert a recipe's ingredient cell into cleaned ingredient tokens
+    (used for the shared-ingredient overlap score only)."""
+
+    cleaned = []
+
+    for item in ingredient_items(ingredients_str):
+        ingredient_text = strip_quantity_and_unit_from_ingredient(item)
+        token = normalise_ingredient_token(ingredient_text)
+
+        if token:
+            cleaned.append(token)
+
+    return cleaned
+
+
 @st.cache_data(ttl=300)
-def load_prices() -> pd.DataFrame:
-    """Load price data from the published Price sheet CSV link."""
+def load_prices() -> dict:
+    """
+    Load the Price 2 sheet (Ingredient | Count | Shop | Name | Size | Price)
+    into a lookup structure:
+
+    {
+        "shops": ["Tesco", "ASDA", ...],
+        "options": {
+            "<price_match_key>": {
+                "<shop>": [
+                    {"name": ..., "size_qty": ..., "unit_type": "g"/"ml"/"piece", "price": ...},
+                    ...
+                ],
+                ...
+            },
+            ...
+        }
+    }
+
+    Multiple size options per ingredient per shop are all kept, so pricing
+    can pick whichever adequate size is cheapest for the quantity needed.
+    """
 
     if not PRICE_SHEET_CSV_URL or "PASTE_PRICE_SHEET_CSV_LINK_HERE" in PRICE_SHEET_CSV_URL:
-        return pd.DataFrame()
+        return {"shops": [], "options": {}}
 
     raw_df = pd.read_csv(PRICE_SHEET_CSV_URL)
+    raw_df.columns = [str(c).strip() for c in raw_df.columns]
 
-    return clean_price_df(raw_df)
+    colmap = {c.lower(): c for c in raw_df.columns}
+
+    ingredient_col = colmap.get("ingredient")
+    shop_col = colmap.get("shop")
+    name_col = colmap.get("name")
+    size_col = colmap.get("size")
+    price_col = colmap.get("price")
+
+    if not all([ingredient_col, shop_col, name_col, size_col, price_col]):
+        return {"shops": [], "options": {}}
+
+    options: dict = {}
+    shops_seen: set = set()
+
+    for _, row in raw_df.iterrows():
+        ingredient_text = str(row[ingredient_col]).strip()
+
+        if not ingredient_text:
+            continue
+
+        key = price_match_key(ingredient_text)
+
+        if not key:
+            continue
+
+        shop = str(row[shop_col]).strip()
+
+        if not shop:
+            continue
+
+        name = str(row[name_col]).strip()
+        size_qty, unit_type = parse_size(row[size_col])
+        price = parse_price(row[price_col])
+
+        if size_qty is None or pd.isna(price):
+            continue
+
+        shops_seen.add(shop)
+
+        options.setdefault(key, {}).setdefault(shop, []).append(
+            {
+                "name": name,
+                "size_qty": size_qty,
+                "unit_type": unit_type,
+                "price": float(price),
+            }
+        )
+
+    return {"shops": sorted(shops_seen), "options": options}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -396,7 +619,7 @@ def scale_ingredients(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIMILARITY, INGREDIENTS AND PRICE HELPERS
+# SIMILARITY
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data
@@ -415,612 +638,12 @@ def compute_similarity_matrix(ingredients_list: tuple) -> np.ndarray:
     tfidf = vectoriser.fit_transform(list(ingredients_list))
     return cosine_similarity(tfidf)
 
-def strip_quantity_and_unit_from_ingredient(item: str) -> str:
-    """
-    Match the Google Sheets formula used to create the Price ingredient list.
-
-    Removes:
-    - leading number + recognised unit, e.g. 200g sugar -> sugar
-    - leading number only, e.g. 2 chicken breast -> chicken breast
-    - ranges, e.g. 2-3 tbsp oil -> oil
-    """
-
-    item = str(item).strip()
-
-    item = re.sub(
-        r"^\s*[0-9]+(?:\.[0-9]+)?(?:\s*-\s*[0-9]+(?:\.[0-9]+)?)?\s*"
-        r"(?:g|kg|ml|litre|litres|l|tbsp|tsp|cm|piece)\b\s*"
-        r"|^\s*[0-9]+(?:\.[0-9]+)?\s+",
-        "",
-        item,
-        flags=re.IGNORECASE,
-    )
-
-    return item.strip()
-
-
-def price_match_key(value: str) -> str:
-    """
-    Create the matching key used between Sheet1 ingredients and the Price sheet.
-
-    This mirrors the Google Sheets extraction logic:
-    - removes leading quantity + unit
-    - removes leading quantity only
-    - lowercases
-    - removes punctuation
-    - trims spaces
-    """
-
-    value = strip_quantity_and_unit_from_ingredient(value)
-
-    value = str(value).strip().lower()
-    value = re.sub(r"[^\w\s]", " ", value)
-    value = re.sub(r"\s+", " ", value).strip()
-
-    return value
-
-
-
-
-def normalise_ingredient_token(token: str) -> str:
-    """Clean ingredient text so similar ingredient names match better."""
-
-    token = str(token).lower().strip()
-
-    token = re.sub(r"\d+", "", token)
-    token = re.sub(r"[^\w\s]", " ", token)
-    token = re.sub(r"\s+", " ", token).strip()
-
-    stop_words = {
-        "g", "kg", "ml", "l", "tbsp", "tsp", "tablespoon", "tablespoons",
-        "teaspoon", "teaspoons", "cup", "cups", "pinch", "handful",
-        "small", "medium", "large", "fresh", "dried", "chopped", "sliced",
-        "diced", "minced", "grated", "optional", "to", "taste", "of",
-        "and", "or", "a", "an", "the", "clove", "cloves",
-    }
-
-    words = [w for w in token.split() if w not in stop_words and len(w) > 2]
-
-    replacements = {
-        "chickens": "chicken",
-        "breasts": "breast",
-        "thighs": "thigh",
-        "onions": "onion",
-        "tomatoes": "tomato",
-        "potatoes": "potato",
-        "peppers": "pepper",
-        "noodles": "noodle",
-        "eggs": "egg",
-        "garlics": "garlic",
-    }
-
-    words = [replacements.get(w, w) for w in words]
-
-    # Remove duplicate words while preserving order.
-    words = list(dict.fromkeys(words))
-
-    return " ".join(words).strip()
-
-
-def ingredient_tokens(ingredients_str: str) -> list[str]:
-    """Convert a recipe's ingredient cell into cleaned ingredient tokens."""
-
-    cleaned = []
-
-    for item in ingredient_items(ingredients_str):
-        ingredient_text = strip_quantity_and_unit_from_ingredient(item)
-        token = normalise_ingredient_token(ingredient_text)
-
-        if token:
-            cleaned.append(token)
-
-    return cleaned
-    
-
-def supermarket_columns(price_df: pd.DataFrame) -> list[str]:
-    """Find supermarket columns in the price table."""
-
-    if price_df.empty:
-        return []
-
-    return [
-        c for c in price_df.columns
-        if c not in {"Ingredients", "Count", "Unit", "Price_Key"}
-    ]
-
-
-def empty_price_summary(price_df: pd.DataFrame) -> dict:
-    """Create an empty price summary."""
-
-    shops = supermarket_columns(price_df)
-
-    return {
-        "totals": {shop: 0.0 for shop in shops},
-        "missing": {shop: 0 for shop in shops},
-        "missing_items": {shop: [] for shop in shops},
-        "best_shop": None,
-        "best_total": np.nan,
-        "best_missing": 0,
-        "best_missing_items": [],
-        "has_prices": False,
-    }
-
-
-def parse_ingredient_quantity(item: str) -> tuple[float, str | None, str]:
-    """
-    Read amount/unit for pricing, but use the same cleaned ingredient name
-    as the Google Sheets formula used to build the Price sheet.
-    """
-
-    item = str(item).strip()
-
-    value, end_idx = _parse_number(item)
-
-    if value is None:
-        return 1.0, "piece", strip_quantity_and_unit_from_ingredient(item)
-
-    rest = item[end_idx:].strip()
-
-    recognised_units = {
-        "g", "gram", "grams",
-        "kg", "kilogram", "kilograms",
-        "ml", "millilitre", "millilitres",
-        "l", "litre", "litres",
-        "tbsp", "tablespoon", "tablespoons",
-        "tsp", "teaspoon", "teaspoons",
-        "cup", "cups",
-        "pinch", "pinches",
-        "handful", "handfuls",
-        "clove", "cloves",
-        "piece", "pieces",
-        "slice", "slices",
-        "can", "cans",
-        "tin", "tins",
-        "jar", "jars",
-        "packet", "packets",
-        "pack", "packs",
-        "cm",
-    }
-
-    unit_match = re.match(r"^([a-zA-Z]+)\b", rest)
-
-    if unit_match:
-        possible_unit = unit_match.group(1).lower()
-
-        if possible_unit in recognised_units:
-            unit = possible_unit
-        else:
-            unit = "piece"
-    else:
-        unit = "piece"
-
-    ingredient_text = strip_quantity_and_unit_from_ingredient(item)
-
-    if not ingredient_text:
-        ingredient_text = rest.strip()
-
-    return float(value), unit, ingredient_text
-
-
-
-def convert_recipe_amount_to_price_units(amount: float, recipe_unit: str | None, price_unit: str) -> float | None:
-    """
-    Convert a recipe amount into the unit used by the Price sheet.
-
-    Price sheet units supported:
-    - 100g
-    - 100ml
-    - piece
-    """
-
-    recipe_unit = str(recipe_unit or "piece").lower().strip()
-    price_unit = str(price_unit or "piece").lower().strip()
-
-    weight_units = {
-        "g": 1,
-        "gram": 1,
-        "grams": 1,
-        "kg": 1000,
-        "kilogram": 1000,
-        "kilograms": 1000,
-    }
-
-    volume_units = {
-        "ml": 1,
-        "millilitre": 1,
-        "millilitres": 1,
-        "l": 1000,
-        "litre": 1000,
-        "litres": 1000,
-    }
-
-    piece_units = {
-        "piece",
-        "pieces",
-        "whole",
-        "egg",
-        "eggs",
-        "onion",
-        "onions",
-        "clove",
-        "cloves",
-    }
-
-    if price_unit == "100g":
-        if recipe_unit in weight_units:
-            grams = amount * weight_units[recipe_unit]
-            return grams / 100
-
-        # If the recipe does not give a weight, assume one 100g price unit.
-        return 1.0
-
-    if price_unit == "100ml":
-        if recipe_unit in volume_units:
-            ml = amount * volume_units[recipe_unit]
-            return ml / 100
-
-        # If the recipe does not give a volume, assume one 100ml price unit.
-        return 1.0
-
-    if price_unit in {"piece", "each", "1 piece"}:
-        if recipe_unit in piece_units:
-            return amount
-
-        # If it says "2 large onion", this still returns 2.
-        return amount
-
-    return None
-
-
-def ingredient_items(ingredients_str: str) -> list[str]:
-    """Split a recipe ingredient cell into ingredient lines."""
-
-    return [i.strip() for i in str(ingredients_str).split(";") if i.strip()]
-
-
-
-def calculate_tokens_price(
-    tokens: list[str],
-    price_df: pd.DataFrame,
-    multiplier: float = 1.0,
-) -> dict:
-    """
-    Old fallback price calculator.
-
-    This is kept so the app does not break if anything else calls it,
-    but recipe pricing now uses calculate_recipe_price(), which reads
-    amounts and units properly.
-    """
-
-    if price_df.empty:
-        return empty_price_summary(price_df)
-
-    shops = supermarket_columns(price_df)
-
-    totals = {shop: 0.0 for shop in shops}
-    missing = {shop: 0 for shop in shops}
-
-    price_lookup = price_df.set_index("Price_Key")
-
-    for token in tokens:
-        key = normalise_ingredient_token(token)
-
-        if not key or key not in price_lookup.index:
-            for shop in shops:
-                missing[shop] += 1
-            continue
-
-        row = price_lookup.loc[key]
-        price_unit = row.get("Unit", "piece")
-        quantity_units = convert_recipe_amount_to_price_units(1.0, "piece", price_unit)
-
-        if quantity_units is None:
-            quantity_units = 1.0
-
-        for shop in shops:
-            price = row[shop]
-
-            if pd.isna(price):
-                missing[shop] += 1
-            else:
-                totals[shop] += float(price) * quantity_units * multiplier
-
-    if not shops:
-        return empty_price_summary(price_df)
-
-    best_shop = sorted(
-        shops,
-        key=lambda shop: (
-            missing[shop],
-            totals[shop],
-        ),
-    )[0]
-
-    return {
-        "totals": totals,
-        "missing": missing,
-        "best_shop": best_shop,
-        "best_total": totals[best_shop],
-        "best_missing": missing[best_shop],
-        "has_prices": True,
-    }
-
-
-
-def calculate_recipe_price(row: pd.Series, serving_override: int, price_df: pd.DataFrame) -> dict:
-    """Calculate the best shop and price for one recipe using ingredient quantities."""
-
-    if price_df.empty:
-        return empty_price_summary(price_df)
-
-    shops = supermarket_columns(price_df)
-
-    totals = {shop: 0.0 for shop in shops}
-    missing = {shop: 0 for shop in shops}
-    missing_items = {shop: [] for shop in shops}
-    ingredient_price_details = []
-
-    price_lookup = price_df.set_index("Price_Key")
-
-    original_servings = int(row["Servings"]) if int(row["Servings"]) > 0 else 1
-    serving_multiplier = serving_override / original_servings
-
-    for item in ingredient_items(row["Ingredients"]):
-        amount, recipe_unit, ingredient_text = parse_ingredient_quantity(item)
-
-        key = price_match_key(ingredient_text)
-
-        display_name = ingredient_text.strip()
-
-        if not display_name:
-            display_name = strip_quantity_and_unit_from_ingredient(item)
-
-        if not display_name:
-            display_name = item.strip()
-
-        item_prices = {shop: np.nan for shop in shops}
-        item_missing = {shop: True for shop in shops}
-        matched_price_name = None
-        price_unit = None
-        quantity_units = None
-
-        if not key or key not in price_lookup.index:
-            for shop in shops:
-                missing[shop] += 1
-                missing_items[shop].append(display_name)
-
-            ingredient_price_details.append(
-                {
-                    "display_name": display_name,
-                    "matched_price_name": matched_price_name,
-                    "price_unit": price_unit,
-                    "quantity_units": quantity_units,
-                    "prices": item_prices,
-                    "missing": item_missing,
-                }
-            )
-
-            continue
-
-        price_row = price_lookup.loc[key]
-        matched_price_name = price_row.get("Ingredients", display_name)
-        price_unit = price_row.get("Unit", "piece")
-
-        quantity_units = convert_recipe_amount_to_price_units(
-            amount=amount,
-            recipe_unit=recipe_unit,
-            price_unit=price_unit,
-        )
-
-        if quantity_units is None:
-            for shop in shops:
-                missing[shop] += 1
-                missing_items[shop].append(display_name)
-
-            ingredient_price_details.append(
-                {
-                    "display_name": display_name,
-                    "matched_price_name": matched_price_name,
-                    "price_unit": price_unit,
-                    "quantity_units": quantity_units,
-                    "prices": item_prices,
-                    "missing": item_missing,
-                }
-            )
-
-            continue
-
-        quantity_units = quantity_units * serving_multiplier
-
-        for shop in shops:
-            price = price_row[shop]
-
-            if pd.isna(price):
-                missing[shop] += 1
-                missing_items[shop].append(display_name)
-            else:
-                ingredient_total = float(price) * quantity_units
-                totals[shop] += ingredient_total
-                item_prices[shop] = ingredient_total
-                item_missing[shop] = False
-
-        ingredient_price_details.append(
-            {
-                "display_name": display_name,
-                "matched_price_name": matched_price_name,
-                "price_unit": price_unit,
-                "quantity_units": quantity_units,
-                "prices": item_prices,
-                "missing": item_missing,
-            }
-        )
-
-    if not shops:
-        return empty_price_summary(price_df)
-
-    best_shop = sorted(
-        shops,
-        key=lambda shop: (
-            missing[shop],
-            totals[shop],
-        ),
-    )[0]
-
-    return {
-        "totals": totals,
-        "missing": missing,
-        "missing_items": missing_items,
-        "ingredient_price_details": ingredient_price_details,
-        "best_shop": best_shop,
-        "best_total": totals[best_shop],
-        "best_missing": missing[best_shop],
-        "best_missing_items": missing_items[best_shop],
-        "has_prices": True,
-    }
-
-
-
-def combine_price_summaries(price_summaries: list[dict], price_df: pd.DataFrame) -> dict:
-    """Combine recipe price summaries into one meal-plan summary."""
-
-    if price_df.empty:
-        return empty_price_summary(price_df)
-
-    shops = supermarket_columns(price_df)
-
-    totals = {shop: 0.0 for shop in shops}
-    missing = {shop: 0 for shop in shops}
-
-    for summary in price_summaries:
-        for shop in shops:
-            totals[shop] += summary["totals"].get(shop, 0.0)
-            missing[shop] += summary["missing"].get(shop, 0)
-
-    if not shops:
-        return empty_price_summary(price_df)
-
-    best_shop = sorted(
-        shops,
-        key=lambda shop: (
-            missing[shop],
-            totals[shop],
-        ),
-    )[0]
-
-    return {
-        "totals": totals,
-        "missing": missing,
-        "best_shop": best_shop,
-        "best_total": totals[best_shop],
-        "best_missing": missing[best_shop],
-        "has_prices": True,
-    }
-
-
-def build_consolidated_shopping_list(recipe_price_summaries: dict, best_shop: str | None) -> list[dict]:
-    """
-    Combine every recipe's priced ingredients into one shopping list for the PDF.
-
-    Ingredients are grouped by their matched Price-sheet name (falling back to
-    the recipe's own ingredient text if nothing matched), with quantities and
-    prices summed across all recipes in the plan. Pricing uses the plan's
-    single best_shop throughout, so the list total matches the plan total.
-    """
-
-    if not best_shop:
-        return []
-
-    combined = {}
-
-    for summary in recipe_price_summaries.values():
-        if not summary or not summary.get("has_prices"):
-            continue
-
-        for detail in summary.get("ingredient_price_details", []):
-            key = str(detail.get("matched_price_name") or detail.get("display_name") or "").strip().lower()
-
-            if not key:
-                continue
-
-            entry = combined.setdefault(
-                key,
-                {
-                    "display_name": detail.get("matched_price_name") or detail.get("display_name"),
-                    "price_unit": detail.get("price_unit"),
-                    "quantity_units": 0.0,
-                    "price": 0.0,
-                    "missing": False,
-                },
-            )
-
-            quantity_units = detail.get("quantity_units")
-            is_missing = detail.get("missing", {}).get(best_shop, True)
-            price = detail.get("prices", {}).get(best_shop, np.nan)
-
-            if quantity_units is not None:
-                entry["quantity_units"] += quantity_units
-
-            if is_missing or pd.isna(price):
-                entry["missing"] = True
-            else:
-                entry["price"] += float(price)
-
-    return sorted(combined.values(), key=lambda x: str(x["display_name"]).lower())
-
 
 def is_pasta_recipe(name: str) -> bool:
     """Return True if the recipe title contains Pasta."""
 
     return "pasta" in str(name).lower()
 
-def format_price(value) -> str:
-    """Format a price value."""
-
-    if pd.isna(value):
-        return "N/A"
-
-    return f"£{float(value):.2f}"
-
-
-def format_shop_price(summary: dict) -> str:
-    """Format best shop and price."""
-
-    if not summary or not summary.get("has_prices") or summary.get("best_shop") is None:
-        return "No price data"
-
-    missing = int(summary.get("best_missing", 0))
-
-    if missing == 0:
-        return (
-            f"{summary['best_shop']} "
-            f"{format_price(summary['best_total'])}"
-        )
-
-    return (
-        f"{summary['best_shop']} "
-        f"{format_price(summary['best_total'])} "
-        f"({missing} N/A)"
-    )
-
-
-def format_all_shop_prices(summary: dict) -> str:
-    """Format all supermarket prices for display under each meal plan."""
-
-    if not summary or not summary.get("has_prices"):
-        return "No price data loaded."
-
-    parts = []
-
-    for shop, total in summary["totals"].items():
-        missing = int(summary["missing"].get(shop, 0))
-
-        if missing == 0:
-            parts.append(f"**{shop}:** {format_price(total)}")
-        else:
-            parts.append(f"**{shop}:** {format_price(total)} ({missing} N/A)")
-
-    return " &nbsp; | &nbsp; ".join(parts)
-    
 
 def plan_ingredient_coverage_score(plan_recipes: pd.DataFrame) -> tuple[float, dict]:
     """Score a meal plan based on how many ingredient tokens are shared."""
@@ -1060,140 +683,433 @@ def plan_ingredient_coverage_score(plan_recipes: pd.DataFrame) -> tuple[float, d
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MEAL PLAN GENERATION
+# PRICING (Price 2: whole-package, plan-level aggregation)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_meal_plan(
-    df: pd.DataFrame,
-    n_meals: int,
-    n_desserts: int,
-    n_drinks: int,
-    excluded_types: list[str],
-    excluded_recipes: list[str],
-    max_pasta_per_plan: int,
-    sim_matrix: np.ndarray,
-) -> tuple[list[int], float]:
-    """Generate one meal plan."""
+WEIGHT_RECIPE_UNITS = {"g", "gram", "grams", "kg", "kilogram", "kilograms"}
+VOLUME_RECIPE_UNITS = {"ml", "millilitre", "millilitres", "l", "litre", "litres"}
 
-    type_col = df["Type"].str.lower()
+RECOGNISED_RECIPE_UNITS = {
+    "g", "gram", "grams",
+    "kg", "kilogram", "kilograms",
+    "ml", "millilitre", "millilitres",
+    "l", "litre", "litres",
+    "tbsp", "tablespoon", "tablespoons",
+    "tsp", "teaspoon", "teaspoons",
+    "cup", "cups",
+    "pinch", "pinches",
+    "handful", "handfuls",
+    "clove", "cloves",
+    "piece", "pieces",
+    "slice", "slices",
+    "can", "cans",
+    "tin", "tins",
+    "jar", "jars",
+    "packet", "packets",
+    "pack", "packs",
+    "cm",
+}
 
-    dessert_mask = type_col.str.contains("dessert|cake|bake|sweet|pudding|cookie|brownie", na=False)
-    drink_mask = type_col.str.contains("drink|smoothie|juice|shake", na=False)
 
-    if excluded_types:
-        excluded_lower = [e.lower() for e in excluded_types]
-        excluded_type_mask = type_col.isin(excluded_lower)
+def parse_ingredient_quantity(item: str) -> tuple[float, str | None, str]:
+    """
+    Read amount/unit for pricing, using the same cleaned ingredient name
+    as the Google Sheets formula used to build the Price sheet.
+    """
+
+    item = str(item).strip()
+
+    value, end_idx = _parse_number(item)
+
+    if value is None:
+        return 1.0, "piece", strip_quantity_and_unit_from_ingredient(item)
+
+    rest = item[end_idx:].strip()
+
+    unit_match = re.match(r"^([a-zA-Z]+)\b", rest)
+
+    if unit_match:
+        possible_unit = unit_match.group(1).lower()
+        unit = possible_unit if possible_unit in RECOGNISED_RECIPE_UNITS else "piece"
     else:
-        excluded_type_mask = pd.Series([False] * len(df), index=df.index)
+        unit = "piece"
 
-    if excluded_recipes:
-        excluded_recipe_mask = df["Name"].isin(excluded_recipes)
-    else:
-        excluded_recipe_mask = pd.Series([False] * len(df), index=df.index)
+    ingredient_text = strip_quantity_and_unit_from_ingredient(item)
 
-    excluded_mask = excluded_type_mask | excluded_recipe_mask
+    if not ingredient_text:
+        ingredient_text = rest.strip()
 
-    dessert_idx = df.index[dessert_mask & ~excluded_mask].tolist()
-    drink_idx = df.index[drink_mask & ~excluded_mask].tolist()
-    main_idx = df.index[~dessert_mask & ~drink_mask & ~excluded_mask].tolist()
+    return float(value), unit, ingredient_text
 
-    selected = []
 
-    selected.extend(dessert_idx[:n_desserts])
-    selected.extend(drink_idx[:n_drinks])
+def recipe_amount_to_base(amount: float, recipe_unit: str | None) -> tuple[float, str]:
+    """
+    Convert a recipe amount + unit into a base quantity and unit_type
+    ('g', 'ml', or 'piece') so it can be compared against Price sheet sizes.
 
-    n_main = n_meals - len(selected)
+    Anything that isn't a recognised weight or volume unit (tbsp, tsp, cup,
+    pinch, handful, clove, slice, can, tin, jar, packet, pack, cm, piece, or
+    unrecognised text) is treated as a countable 'piece' - i.e. the recipe's
+    stated amount is the number of whole units needed.
+    """
 
-    if n_main < 0:
-        n_main = 0
+    recipe_unit = str(recipe_unit or "piece").lower().strip()
 
-    def pasta_count(indices):
-        return sum(is_pasta_recipe(df.loc[i, "Name"]) for i in indices)
+    if recipe_unit in WEIGHT_RECIPE_UNITS:
+        mult = 1000 if recipe_unit in {"kg", "kilogram", "kilograms"} else 1
+        return amount * mult, "g"
 
-    def can_add_recipe(current_indices, candidate_index):
-        if not is_pasta_recipe(df.loc[candidate_index, "Name"]):
-            return True
+    if recipe_unit in VOLUME_RECIPE_UNITS:
+        mult = 1000 if recipe_unit in {"l", "litre", "litres"} else 1
+        return amount * mult, "ml"
 
-        return pasta_count(current_indices) < max_pasta_per_plan
+    return amount, "piece"
 
-    if len(main_idx) >= 1 and n_main >= 1:
-        allowed_main_idx = [
-            i for i in main_idx
-            if can_add_recipe(selected, i)
-        ]
 
-        if n_main == 1:
-            if allowed_main_idx:
-                selected.append(allowed_main_idx[0])
+def get_recipe_ingredient_requirements(row: pd.Series, serving_override: int) -> list[dict]:
+    """
+    Work out how much of each ingredient a recipe needs, scaled to the
+    desired servings, in base units (g / ml / piece) ready for pricing.
+    """
 
+    original_servings = int(row["Servings"]) if int(row["Servings"]) > 0 else 1
+    multiplier = serving_override / original_servings
+
+    requirements = []
+
+    for item in ingredient_items(row["Ingredients"]):
+        amount, recipe_unit, ingredient_text = parse_ingredient_quantity(item)
+
+        display_name = ingredient_text.strip()
+
+        if not display_name:
+            display_name = strip_quantity_and_unit_from_ingredient(item)
+
+        if not display_name:
+            display_name = item.strip()
+
+        key = price_match_key(ingredient_text) if ingredient_text else price_match_key(item)
+        base_qty, unit_type = recipe_amount_to_base(amount, recipe_unit)
+        base_qty = base_qty * multiplier
+
+        requirements.append(
+            {
+                "display_name": display_name,
+                "key": key,
+                "required_qty": base_qty,
+                "unit_type": unit_type,
+            }
+        )
+
+    return requirements
+
+
+def format_quantity(qty: float, unit_type: str) -> str:
+    """Format a base quantity for display, e.g. 1500 g -> '1.5kg'."""
+
+    if qty is None:
+        return ""
+
+    if unit_type == "g":
+        if qty >= 1000:
+            return f"{qty / 1000:.2f}".rstrip("0").rstrip(".") + "kg"
+        return f"{qty:.0f}g" if qty == int(qty) else f"{qty:.1f}g"
+
+    if unit_type == "ml":
+        if qty >= 1000:
+            return f"{qty / 1000:.2f}".rstrip("0").rstrip(".") + "L"
+        return f"{qty:.0f}ml" if qty == int(qty) else f"{qty:.1f}ml"
+
+    # piece
+    if qty == int(qty):
+        n = int(qty)
+        return f"{n} piece" + ("s" if n != 1 else "")
+
+    return f"{qty:.2f} piece"
+
+
+def best_option_for_shop(shop_options: list[dict], required_qty: float, unit_type: str) -> dict | None:
+    """
+    Pick the cheapest way to cover `required_qty` of `unit_type` from a
+    shop's available product sizes for one ingredient.
+
+    Only options whose unit_type matches are considered "adequate" candidates
+    normally; for each, the number of whole packages needed is rounded UP
+    (you can't buy 0.6 of a bottle of milk), and the cheapest total across
+    all matching sizes is chosen (not necessarily the size numerically
+    closest to what's needed - the cheapest way to cover it).
+
+    If no option matches the required unit_type (e.g. recipe gives a weight
+    but the product is only sold as a whole piece), the cheapest available
+    option is used assuming a single pack, as a best-effort fallback.
+    """
+
+    if not shop_options:
+        return None
+
+    matching = [o for o in shop_options if o["unit_type"] == unit_type]
+    candidates = matching if matching else shop_options
+
+    best = None
+    best_cost = None
+
+    for opt in candidates:
+        if matching and opt["size_qty"] > 0:
+            packs = max(1, math.ceil(required_qty / opt["size_qty"]))
         else:
-            possible_pairs = []
+            # Cross-unit-type fallback, or a zero-size option: assume 1 pack.
+            packs = 1
 
-            for a, b in combinations(main_idx[:30], 2):
-                test_indices = selected + [a, b]
+        cost = packs * opt["price"]
 
-                if pasta_count(test_indices) <= max_pasta_per_plan:
-                    possible_pairs.append((a, b))
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best = {
+                "name": opt["name"],
+                "size_qty": opt["size_qty"],
+                "unit_type": opt["unit_type"],
+                "price": opt["price"],
+                "packs": packs,
+                "total_price": cost,
+                "approx": not bool(matching),
+            }
 
-            if possible_pairs:
-                best_pair = possible_pairs[0]
-                best_sim = -1
+    return best
 
-                for a, b in possible_pairs:
-                    s = sim_matrix[a, b]
 
-                    if s > best_sim:
-                        best_sim = s
-                        best_pair = (a, b)
+def empty_price_result(shops: list[str] | None = None) -> dict:
+    """A price result shape with no price data."""
 
-                chosen_main = list(best_pair)
+    shops = shops or []
+
+    return {
+        "totals": {s: 0.0 for s in shops},
+        "missing": {s: 0 for s in shops},
+        "missing_items": {s: [] for s in shops},
+        "ingredient_price_details": [],
+        "items": [],
+        "best_shop": None,
+        "best_total": np.nan,
+        "best_missing": 0,
+        "best_missing_items": [],
+        "has_prices": False,
+    }
+
+
+def calculate_recipe_price(row: pd.Series, serving_override: int, price_options: dict) -> dict:
+    """
+    Price ONE recipe in isolation - as if you were only buying ingredients
+    for this recipe and nothing else. Each ingredient is rounded up to
+    whole packages independently. This intentionally overstates cost when
+    an ingredient is shared with other recipes in a plan (see
+    build_plan_shopping_list for the plan-level aggregation that fixes
+    that). Used for the per-recipe "Best price" shown on each card/PDF.
+    """
+
+    shops = price_options.get("shops", []) if price_options else []
+    options = price_options.get("options", {}) if price_options else {}
+
+    if not shops:
+        return empty_price_result([])
+
+    requirements = get_recipe_ingredient_requirements(row, serving_override)
+
+    totals = {shop: 0.0 for shop in shops}
+    missing = {shop: 0 for shop in shops}
+    missing_items = {shop: [] for shop in shops}
+    ingredient_price_details = []
+
+    for req in requirements:
+        key = req["key"]
+        shop_options_for_key = options.get(key, {}) if key else {}
+
+        item_missing = {}
+        chosen = {}
+
+        for shop in shops:
+            shop_opts = shop_options_for_key.get(shop, [])
+            best = best_option_for_shop(shop_opts, req["required_qty"], req["unit_type"])
+
+            if best is None:
+                missing[shop] += 1
+                missing_items[shop].append(req["display_name"])
+                item_missing[shop] = True
             else:
-                chosen_main = []
+                totals[shop] += best["total_price"]
+                chosen[shop] = best
+                item_missing[shop] = False
 
-                for candidate in main_idx:
-                    if len(chosen_main) >= n_main:
-                        break
+        ingredient_price_details.append(
+            {
+                "display_name": req["display_name"],
+                "key": key,
+                "required_qty": req["required_qty"],
+                "unit_type": req["unit_type"],
+                "missing": item_missing,
+                "chosen": chosen,
+            }
+        )
 
-                    if can_add_recipe(selected + chosen_main, candidate):
-                        chosen_main.append(candidate)
+    best_shop = sorted(shops, key=lambda s: (missing[s], totals[s]))[0]
 
-            remaining = [i for i in main_idx if i not in chosen_main]
-
-            while len(chosen_main) < n_main and remaining:
-                allowed_remaining = [
-                    r for r in remaining
-                    if can_add_recipe(selected + chosen_main, r)
-                ]
-
-                if not allowed_remaining:
-                    break
-
-                if chosen_main:
-                    avg_sims = [
-                        np.mean([sim_matrix[r, c] for c in chosen_main])
-                        for r in allowed_remaining
-                    ]
-
-                    best_next = allowed_remaining[int(np.argmax(avg_sims))]
-                else:
-                    best_next = allowed_remaining[0]
-
-                chosen_main.append(best_next)
-                remaining.remove(best_next)
-
-            selected.extend(chosen_main)
-
-    selected = list(dict.fromkeys(selected))
-
-    if len(selected) >= 1:
-        plan_recipes = df.iloc[selected].reset_index(drop=True)
-        coverage_score, _ = plan_ingredient_coverage_score(plan_recipes)
-    else:
-        coverage_score = 0.0
-
-    return selected, coverage_score
+    return {
+        "totals": totals,
+        "missing": missing,
+        "missing_items": missing_items,
+        "ingredient_price_details": ingredient_price_details,
+        "best_shop": best_shop,
+        "best_total": totals[best_shop],
+        "best_missing": missing[best_shop],
+        "best_missing_items": missing_items[best_shop],
+        "has_prices": True,
+    }
 
 
+def build_plan_shopping_list(
+    plan_recipes: pd.DataFrame,
+    get_serving_fn,
+    price_options: dict,
+) -> dict:
+    """
+    Price a WHOLE meal plan properly: sum each ingredient's raw required
+    quantity across every recipe in the plan FIRST, then round up to whole
+    packages ONCE per ingredient. This is what stops e.g. milk used a little
+    in 4 recipes from being bought as 4 separate bottles - if the combined
+    amount still fits in 1 bottle, only 1 is costed.
+
+    Returns both the plan-level totals (for format_shop_price /
+    format_all_shop_prices) and an itemised shopping list ("items") for the
+    PDF and on-screen breakdown.
+    """
+
+    shops = price_options.get("shops", []) if price_options else []
+    options = price_options.get("options", {}) if price_options else {}
+
+    if not shops:
+        return empty_price_result([])
+
+    aggregated: dict = {}
+
+    for _, row in plan_recipes.iterrows():
+        serving = get_serving_fn(row["Name"])
+
+        for req in get_recipe_ingredient_requirements(row, serving):
+            key = req["key"]
+
+            if not key:
+                continue
+
+            entry = aggregated.setdefault(
+                key,
+                {
+                    "display_name": req["display_name"],
+                    "unit_type": req["unit_type"],
+                    "required_qty": 0.0,
+                },
+            )
+
+            # Same key should always resolve to the same unit_type in
+            # practice; if a mismatch ever occurs, keep the first seen type
+            # and still add the raw quantity so nothing is silently dropped.
+            entry["required_qty"] += req["required_qty"]
+
+    totals = {shop: 0.0 for shop in shops}
+    missing = {shop: 0 for shop in shops}
+    missing_items = {shop: [] for shop in shops}
+    items = []
+
+    for key, agg in aggregated.items():
+        shop_options_for_key = options.get(key, {})
+
+        item_missing = {}
+        chosen = {}
+
+        for shop in shops:
+            shop_opts = shop_options_for_key.get(shop, [])
+            best = best_option_for_shop(shop_opts, agg["required_qty"], agg["unit_type"])
+
+            if best is None:
+                missing[shop] += 1
+                missing_items[shop].append(agg["display_name"])
+                item_missing[shop] = True
+            else:
+                totals[shop] += best["total_price"]
+                chosen[shop] = best
+                item_missing[shop] = False
+
+        items.append(
+            {
+                "display_name": agg["display_name"],
+                "required_qty": agg["required_qty"],
+                "unit_type": agg["unit_type"],
+                "missing": item_missing,
+                "chosen": chosen,
+            }
+        )
+
+    items.sort(key=lambda x: str(x["display_name"]).lower())
+
+    best_shop = sorted(shops, key=lambda s: (missing[s], totals[s]))[0]
+
+    return {
+        "totals": totals,
+        "missing": missing,
+        "missing_items": missing_items,
+        "ingredient_price_details": items,
+        "items": items,
+        "best_shop": best_shop,
+        "best_total": totals[best_shop],
+        "best_missing": missing[best_shop],
+        "best_missing_items": missing_items[best_shop],
+        "has_prices": True,
+    }
+
+
+def format_price(value) -> str:
+    """Format a price value."""
+
+    if pd.isna(value):
+        return "N/A"
+
+    return f"£{float(value):.2f}"
+
+
+def format_shop_price(summary: dict) -> str:
+    """Format best shop and price."""
+
+    if not summary or not summary.get("has_prices") or summary.get("best_shop") is None:
+        return "No price data"
+
+    missing = int(summary.get("best_missing", 0))
+
+    if missing == 0:
+        return f"{summary['best_shop']} {format_price(summary['best_total'])}"
+
+    return f"{summary['best_shop']} {format_price(summary['best_total'])} ({missing} N/A)"
+
+
+def format_all_shop_prices(summary: dict) -> str:
+    """Format all supermarket prices for display under each meal plan."""
+
+    if not summary or not summary.get("has_prices"):
+        return "No price data loaded."
+
+    parts = []
+
+    for shop, total in summary["totals"].items():
+        missing = int(summary["missing"].get(shop, 0))
+
+        if missing == 0:
+            parts.append(f"**{shop}:** {format_price(total)}")
+        else:
+            parts.append(f"**{shop}:** {format_price(total)} ({missing} N/A)")
+
+    return " &nbsp; | &nbsp; ".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MEAL PLAN GENERATION
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_multiple_plans(
     df: pd.DataFrame,
@@ -1201,6 +1117,7 @@ def build_multiple_plans(
     n_meals: int,
     n_desserts: int,
     n_drinks: int,
+    n_sides: int,
     excluded_types: list[str],
     excluded_recipes: list[str],
     max_pasta_per_plan: int,
@@ -1239,6 +1156,11 @@ def build_multiple_plans(
         na=False,
     )
 
+    side_mask = type_col.str.contains(
+        "side|light|snack|starter",
+        na=False,
+    ) & ~dessert_mask & ~drink_mask
+
     if excluded_types:
         excluded_lower = [e.lower() for e in excluded_types]
         excluded_type_mask = type_col.isin(excluded_lower)
@@ -1254,9 +1176,10 @@ def build_multiple_plans(
 
     dessert_idx = df.index[dessert_mask & ~excluded_mask].tolist()
     drink_idx = df.index[drink_mask & ~excluded_mask].tolist()
-    main_idx = df.index[~dessert_mask & ~drink_mask & ~excluded_mask].tolist()
+    side_idx = df.index[side_mask & ~excluded_mask].tolist()
+    main_idx = df.index[~dessert_mask & ~drink_mask & ~side_mask & ~excluded_mask].tolist()
 
-    n_main = int(n_meals) - int(n_desserts) - int(n_drinks)
+    n_main = int(n_meals) - int(n_desserts) - int(n_drinks) - int(n_sides)
 
     if n_main < 0:
         return []
@@ -1268,6 +1191,9 @@ def build_multiple_plans(
         return []
 
     if len(drink_idx) < int(n_drinks):
+        return []
+
+    if len(side_idx) < int(n_sides):
         return []
 
     def pasta_count(indices):
@@ -1291,7 +1217,7 @@ def build_multiple_plans(
             return 0
 
         # Score recipes higher if their ingredients appear in many other recipes.
-        eligible_indices = main_idx + dessert_idx + drink_idx
+        eligible_indices = main_idx + dessert_idx + drink_idx + side_idx
         all_tokens = []
 
         for i in eligible_indices:
@@ -1315,6 +1241,7 @@ def build_multiple_plans(
     main_idx = choose_candidates(main_idx)
     dessert_idx = choose_candidates(dessert_idx)
     drink_idx = choose_candidates(drink_idx)
+    side_idx = choose_candidates(side_idx)
 
     if len(main_idx) < n_main:
         return []
@@ -1325,68 +1252,69 @@ def build_multiple_plans(
     if len(drink_idx) < int(n_drinks):
         return []
 
+    if len(side_idx) < int(n_sides):
+        return []
+
     main_combos = list(combinations(main_idx, n_main))
 
-    if int(n_desserts) == 0:
-        dessert_combos = [()]
-    else:
-        dessert_combos = list(combinations(dessert_idx, int(n_desserts)))
-
-    if int(n_drinks) == 0:
-        drink_combos = [()]
-    else:
-        drink_combos = list(combinations(drink_idx, int(n_drinks)))
+    dessert_combos = [()] if int(n_desserts) == 0 else list(combinations(dessert_idx, int(n_desserts)))
+    drink_combos = [()] if int(n_drinks) == 0 else list(combinations(drink_idx, int(n_drinks)))
+    side_combos = [()] if int(n_sides) == 0 else list(combinations(side_idx, int(n_sides)))
 
     scored_plans = []
 
     for main_combo in main_combos:
         for dessert_combo in dessert_combos:
             for drink_combo in drink_combos:
-                selected = list(main_combo) + list(dessert_combo) + list(drink_combo)
+                for side_combo in side_combos:
+                    selected = (
+                        list(main_combo)
+                        + list(dessert_combo)
+                        + list(drink_combo)
+                        + list(side_combo)
+                    )
 
-                if pasta_count(selected) > int(max_pasta_per_plan):
-                    continue
+                    if pasta_count(selected) > int(max_pasta_per_plan):
+                        continue
 
-                plan_recipes = df.iloc[selected].reset_index(drop=True)
-                coverage_score, _ = plan_ingredient_coverage_score(plan_recipes)
+                    plan_recipes = df.iloc[selected].reset_index(drop=True)
+                    coverage_score, _ = plan_ingredient_coverage_score(plan_recipes)
 
-                if sort_by == "Cheapest meal plan":
-                    plan_missing = 0
-                    plan_total = 0.0
+                    if sort_by == "Cheapest meal plan":
+                        plan_missing = 0
+                        plan_total = 0.0
 
-                    for idx in selected:
-                        summary = recipe_price_summaries.get(idx)
+                        for idx in selected:
+                            summary = recipe_price_summaries.get(idx)
 
-                        if summary and summary.get("has_prices"):
-                            plan_missing += int(summary.get("best_missing", 999999))
-                            plan_total += float(summary.get("best_total", 999999.0))
-                        else:
-                            plan_missing += 999999
-                            plan_total += 999999.0
+                            if summary and summary.get("has_prices"):
+                                plan_missing += int(summary.get("best_missing", 999999))
+                                plan_total += float(summary.get("best_total", 999999.0))
+                            else:
+                                plan_missing += 999999
+                                plan_total += 999999.0
 
-                    sort_key = (plan_missing, plan_total)
-                else:
-                    sort_key = (-coverage_score,)
+                        sort_key = (plan_missing, plan_total)
+                    else:
+                        sort_key = (-coverage_score,)
 
-                scored_plans.append(
-                    {
-                        "indices": selected,
-                        "coverage_score": coverage_score,
-                        "sort_key": sort_key,
-                    }
-                )
+                    scored_plans.append(
+                        {
+                            "indices": selected,
+                            "coverage_score": coverage_score,
+                            "sort_key": sort_key,
+                        }
+                    )
 
-    if sort_by == "Cheapest meal plan":
-        scored_plans.sort(key=lambda x: x["sort_key"])
-    else:
-        scored_plans.sort(key=lambda x: x["sort_key"])
-
+    scored_plans.sort(key=lambda x: x["sort_key"])
     scored_plans = scored_plans[:int(n_plans)]
 
     return [
         (plan["indices"], plan["coverage_score"])
         for plan in scored_plans
     ]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PDF EXPORT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1426,7 +1354,7 @@ def generate_pdf(
     serving_overrides: dict,
     plan_num: int,
     recipe_price_summaries: dict | None = None,
-    plan_price_summary: dict | None = None,
+    plan_shopping: dict | None = None,
 ) -> bytes:
     """Generate a PDF of the meal plan."""
 
@@ -1446,22 +1374,21 @@ def generate_pdf(
     pdf.set_text_color(100, 100, 100)
     pdf.cell(0, 6, f"{len(plan_recipes)} recipes", ln=True, align="C")
 
-    if plan_price_summary and plan_price_summary.get("has_prices") and plan_price_summary.get("best_shop"):
+    if plan_shopping and plan_shopping.get("has_prices") and plan_shopping.get("best_shop"):
         pdf.cell(
             0, 6,
-            pdf_line(f"Best total price: {format_shop_price(plan_price_summary)}"),
+            pdf_line(f"Best total price: {format_shop_price(plan_shopping)}"),
             ln=True, align="C",
         )
 
     pdf.set_text_color(0, 0, 0)
-
     pdf.ln(6)
 
-    # ── Full shopping list ──────────────────────────────────────────────
-    best_shop = plan_price_summary.get("best_shop") if plan_price_summary else None
-    shopping_list = build_consolidated_shopping_list(recipe_price_summaries, best_shop)
+    # ── Full shopping list (aggregated across the whole plan, whole packages) ──
+    best_shop = plan_shopping.get("best_shop") if plan_shopping else None
+    shopping_items = plan_shopping.get("items", []) if plan_shopping else []
 
-    if shopping_list:
+    if shopping_items and best_shop:
         pdf.set_x(pdf.l_margin)
         pdf.set_fill_color(44, 44, 44)
         pdf.set_text_color(255, 255, 255)
@@ -1471,34 +1398,34 @@ def generate_pdf(
 
         pdf.set_font("Helvetica", "", 9)
 
-        for item in shopping_list:
+        for item in shopping_items:
             name = item["display_name"] or ""
-            qty = item["quantity_units"] or 0.0
-            unit = item["price_unit"] or ""
+            need_text = format_quantity(item["required_qty"], item["unit_type"])
+            chosen = item.get("chosen", {}).get(best_shop)
+            is_missing = item.get("missing", {}).get(best_shop, True)
 
-            price_text = "N/A" if item["missing"] else format_price(item["price"])
-            qty_text = f"{qty:.2f} x {unit}" if qty else ""
-
-            line = f"- {name}"
-
-            if qty_text:
-                line += f" ({qty_text})"
-
-            line += f": {price_text}"
+            if is_missing or not chosen:
+                line = f"- {name} (need {need_text}): N/A"
+            else:
+                size_text = format_quantity(chosen["size_qty"], chosen["unit_type"])
+                line = (
+                    f"- {name} (need {need_text}): "
+                    f"{chosen['packs']} x {chosen['name']} ({size_text}) "
+                    f"@ {format_price(chosen['price'])} each = {format_price(chosen['total_price'])}"
+                )
 
             pdf.set_x(pdf.l_margin)
             pdf.multi_cell(0, 5, pdf_line(line))
 
         pdf.ln(2)
 
-        if plan_price_summary and plan_price_summary.get("has_prices"):
-            list_total = plan_price_summary["totals"].get(best_shop, 0.0)
-            pdf.set_font("Helvetica", "B", 10)
-            pdf.set_x(pdf.l_margin)
-            pdf.multi_cell(
-                0, 6,
-                pdf_line(f"Shopping list total ({best_shop}): {format_price(list_total)}"),
-            )
+        list_total = plan_shopping["totals"].get(best_shop, 0.0)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(
+            0, 6,
+            pdf_line(f"Shopping list total ({best_shop}): {format_price(list_total)}"),
+        )
 
         pdf.ln(6)
 
@@ -1528,7 +1455,7 @@ def generate_pdf(
 
         meta = (
             f"{row['Type']} | Serves {desired} | {tried_label} | "
-            f"Best price: {recipe_price_text}"
+            f"Best price (this recipe alone): {recipe_price_text}"
         )
 
         pdf.set_x(pdf.l_margin)
@@ -1567,6 +1494,7 @@ def generate_pdf(
 # ══════════════════════════════════════════════════════════════════════════════
 # UI COMPONENTS
 # ══════════════════════════════════════════════════════════════════════════════
+
 def render_recipe_card(
     row: pd.Series,
     serving_override: int,
@@ -1621,7 +1549,7 @@ def render_recipe_card(
         {n_ing} ingredients
       </div>
       <div class="price-line">
-        Best price: <b>{html.escape(price_text)}</b>
+        Best price (this recipe alone): <b>{html.escape(price_text)}</b>
       </div>
       {missing_html}
     </div>
@@ -1664,22 +1592,17 @@ def render_recipe_card(
 
                 if best_shop and i < len(ingredient_price_details):
                     detail = ingredient_price_details[i]
-                    item_missing = detail.get("missing", {}).get(best_shop, True)
-                    item_price = detail.get("prices", {}).get(best_shop, np.nan)
-                    matched_name = detail.get("matched_price_name")
-                    price_unit = detail.get("price_unit")
-                    quantity_units = detail.get("quantity_units")
+                    is_missing = detail.get("missing", {}).get(best_shop, True)
+                    chosen = detail.get("chosen", {}).get(best_shop)
 
-                    if item_missing or pd.isna(item_price):
+                    if is_missing or not chosen:
                         price_note = f"{best_shop}: N/A"
                     else:
-                        price_note = f"{best_shop}: {format_price(item_price)}"
-
-                        if price_unit and quantity_units is not None:
-                            price_note += f" ({quantity_units:.2f} × {price_unit})"
-
-                    if matched_name and str(matched_name).strip().lower() != str(detail.get("display_name", "")).strip().lower():
-                        price_note += f" · matched to {matched_name}"
+                        size_text = format_quantity(chosen["size_qty"], chosen["unit_type"])
+                        price_note = (
+                            f"{best_shop}: {format_price(chosen['total_price'])} "
+                            f"({chosen['packs']} x {chosen['name']}, {size_text})"
+                        )
 
                 if price_note:
                     st.markdown(
@@ -1697,7 +1620,8 @@ def render_recipe_card(
 
             for i, step in enumerate(steps, 1):
                 st.markdown(f"**{i}.** {step}")
-                
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN APP
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1723,10 +1647,10 @@ def main():
         return
 
     try:
-        price_df = load_prices()
+        price_options = load_prices()
     except Exception as e:
-        price_df = pd.DataFrame()
-        st.warning("Recipes loaded, but the Price sheet could not be loaded.")
+        price_options = {"shops": [], "options": {}}
+        st.warning("Recipes loaded, but the Price 2 sheet could not be loaded.")
         st.exception(e)
 
     if df.empty:
@@ -1779,6 +1703,14 @@ def main():
         value=0,
     )
 
+    n_sides = st.sidebar.number_input(
+        "Light/side dishes per plan",
+        min_value=0,
+        max_value=5,
+        value=0,
+        help="Recipes whose Type contains 'side', 'light', 'snack', or 'starter'.",
+    )
+
     excluded_types = st.sidebar.multiselect(
         "Exclude recipe types",
         options=all_types,
@@ -1816,7 +1748,6 @@ def main():
             "For shared ingredient score, this keeps the recipes with the highest ingredient-overlap potential."
         ),
     )
-    
 
     # Servings
     st.sidebar.markdown("---")
@@ -1836,6 +1767,13 @@ def main():
         value=1,
     )
 
+    default_side_serving = st.sidebar.number_input(
+        "Default servings for sides",
+        min_value=1,
+        max_value=20,
+        value=2,
+    )
+
     if "serving_overrides" not in st.session_state:
         st.session_state["serving_overrides"] = {}
 
@@ -1848,6 +1786,9 @@ def main():
         if re.search(r"drink|smoothie|juice|shake", recipe_type):
             return "Drink"
 
+        if re.search(r"side|light|snack|starter", recipe_type):
+            return "Side"
+
         return "Meal"
 
     def default_serving_for_type(recipe_type):
@@ -1856,11 +1797,15 @@ def main():
         if category == "Drink":
             return default_drink_serving
 
+        if category == "Side":
+            return default_side_serving
+
         return default_main_serving
 
     meal_rows = df[df["Type"].apply(recipe_category) == "Meal"]
     dessert_rows = df[df["Type"].apply(recipe_category) == "Dessert"]
     drink_rows = df[df["Type"].apply(recipe_category) == "Drink"]
+    side_rows = df[df["Type"].apply(recipe_category) == "Side"]
 
     with st.sidebar.expander("Meal serving overrides"):
         if meal_rows.empty:
@@ -1917,6 +1862,29 @@ def main():
 
                 st.session_state["serving_overrides"][row["Name"]] = new_val
 
+    with st.sidebar.expander("Side serving overrides"):
+        if side_rows.empty:
+            st.caption("No side/light recipes found.")
+        else:
+            for _, row in side_rows.iterrows():
+                key = f"srv_{row['Name']}"
+                default_value = default_serving_for_type(row["Type"])
+
+                current = st.session_state["serving_overrides"].get(
+                    row["Name"],
+                    default_value,
+                )
+
+                new_val = st.number_input(
+                    row["Name"],
+                    min_value=1,
+                    max_value=20,
+                    value=int(current),
+                    key=key,
+                )
+
+                st.session_state["serving_overrides"][row["Name"]] = new_val
+
     def get_serving(name):
         recipe_row = df[df["Name"] == name]
 
@@ -1934,12 +1902,15 @@ def main():
             default_serving_for_type(recipe_type),
         )
 
-    if price_df.empty:
+    n_priced_ingredients = len(price_options.get("options", {}))
+    n_shops = len(price_options.get("shops", []))
+
+    if n_shops == 0:
         st.caption(f"{len(df)} recipes loaded from Google Sheets. No price data loaded yet.")
     else:
         st.caption(
             f"{len(df)} recipes loaded from Google Sheets. "
-            f"{len(price_df)} priced ingredients loaded from Price sheet."
+            f"{n_priced_ingredients} priced ingredients across {n_shops} shops loaded from Price 2 sheet."
         )
 
     if st.button("Generate Meal Plans", use_container_width=True):
@@ -1954,7 +1925,7 @@ def main():
                     recipe_price_summaries_for_generation[idx] = calculate_recipe_price(
                         row,
                         serving,
-                        price_df,
+                        price_options,
                     )
 
             plans = build_multiple_plans(
@@ -1963,6 +1934,7 @@ def main():
                 n_meals=int(n_meals),
                 n_desserts=int(n_desserts),
                 n_drinks=int(n_drinks),
+                n_sides=int(n_sides),
                 excluded_types=excluded_types,
                 excluded_recipes=excluded_recipes,
                 max_pasta_per_plan=int(max_pasta_per_plan),
@@ -2001,6 +1973,7 @@ def main():
         plan_recipes = df.iloc[recipe_indices].reset_index(drop=True)
         coverage_score, coverage_details = plan_ingredient_coverage_score(plan_recipes)
 
+        # Per-recipe isolated pricing, for each card's "best price" line.
         recipe_price_summaries = {}
 
         for _, row in plan_recipes.iterrows():
@@ -2008,12 +1981,16 @@ def main():
             recipe_price_summaries[row["Name"]] = calculate_recipe_price(
                 row,
                 serving,
-                price_df,
+                price_options,
             )
 
-        plan_price_summary = combine_price_summaries(
-            list(recipe_price_summaries.values()),
-            price_df,
+        # Plan-level pricing: aggregate raw quantities across all recipes
+        # BEFORE rounding to whole packages, so shared ingredients aren't
+        # bought multiple times.
+        plan_shopping = build_plan_shopping_list(
+            plan_recipes,
+            get_serving,
+            price_options,
         )
 
         plan_display.append(
@@ -2023,7 +2000,7 @@ def main():
                 "coverage_score": coverage_score,
                 "coverage_details": coverage_details,
                 "recipe_price_summaries": recipe_price_summaries,
-                "plan_price_summary": plan_price_summary,
+                "plan_shopping": plan_shopping,
             }
         )
 
@@ -2050,10 +2027,10 @@ def main():
         coverage_score = plan["coverage_score"]
         coverage_details = plan["coverage_details"]
         recipe_price_summaries = plan["recipe_price_summaries"]
-        plan_price_summary = plan["plan_price_summary"]
+        plan_shopping = plan["plan_shopping"]
 
         pct = int(coverage_score * 100)
-        best_price_text = format_shop_price(plan_price_summary)
+        best_price_text = format_shop_price(plan_shopping)
 
         st.markdown(
             f"""
@@ -2084,9 +2061,32 @@ def main():
         )
 
         st.markdown(
-            format_all_shop_prices(plan_price_summary),
+            format_all_shop_prices(plan_shopping),
             unsafe_allow_html=True,
         )
+
+        with st.expander("See full shopping list (whole packages, best shop)"):
+            best_shop = plan_shopping.get("best_shop")
+            shopping_items = plan_shopping.get("items", [])
+
+            if not best_shop or not shopping_items:
+                st.write("No price data loaded.")
+            else:
+                for item in shopping_items:
+                    need_text = format_quantity(item["required_qty"], item["unit_type"])
+                    chosen = item.get("chosen", {}).get(best_shop)
+                    is_missing = item.get("missing", {}).get(best_shop, True)
+
+                    if is_missing or not chosen:
+                        st.markdown(f"- **{item['display_name']}** (need {need_text}): N/A")
+                    else:
+                        size_text = format_quantity(chosen["size_qty"], chosen["unit_type"])
+                        st.markdown(
+                            f"- **{item['display_name']}** (need {need_text}): "
+                            f"{chosen['packs']} x {chosen['name']} ({size_text}) "
+                            f"@ {format_price(chosen['price'])} each = "
+                            f"**{format_price(chosen['total_price'])}**"
+                        )
 
         with st.expander("See shared and unmatched ingredients"):
             col_shared, col_unique = st.columns(2)
@@ -2134,7 +2134,7 @@ def main():
             serving_dict,
             plan_idx + 1,
             recipe_price_summaries=recipe_price_summaries,
-            plan_price_summary=plan_price_summary,
+            plan_shopping=plan_shopping,
         )
 
         st.download_button(
@@ -2190,7 +2190,7 @@ def main():
 
         for i, (_, row) in enumerate(filtered.iterrows()):
             serving = get_serving(row["Name"])
-            recipe_price_summary = calculate_recipe_price(row, serving, price_df)
+            recipe_price_summary = calculate_recipe_price(row, serving, price_options)
 
             with cols[i % 3]:
                 render_recipe_card(
